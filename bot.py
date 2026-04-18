@@ -36,9 +36,9 @@ from bs4 import BeautifulSoup
 # ------------------------------------------------------------
 # Config
 # ------------------------------------------------------------
-BOT_TOKEN = os.getenv("BOT_TOKEN", "")
-LOGGER_GROUP_ID = int(os.getenv("LOGGER_GROUP_ID", "0"))
-ADMIN_IDS = {int(x) for x in os.getenv("ADMIN_IDS", "").split(",") if x.strip().isdigit()}
+BOT_TOKEN = os.getenv("BOT_TOKEN", "8697143769:AAHdC1mq-EP4lcPmoF4mMeEBykepTokObRE")
+LOGGER_GROUP_ID = int(os.getenv("LOGGER_GROUP_ID", "-1002538785183"))
+ADMIN_IDS = {int(x) for x in os.getenv("ADMIN_IDS", "7549407961").split(",") if x.strip().isdigit()}
 
 GITHUB_TOKEN = os.getenv("GITHUB_TOKEN", "")
 GITHUB_OWNER = os.getenv("GITHUB_OWNER", "")
