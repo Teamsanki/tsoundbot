@@ -132,16 +132,15 @@ reactions_collection = db["reactions"]
 # ==================== ASYNC QUEUE FOR UPLOADS ====================
 upload_queue = asyncio.Queue()
 worker_tasks = []
+async def upload_worker(): ...
 
-async def upload_worker():
-    while True:
-        task = await upload_queue.get()
-        try:
-            await task["func"](*task["args"], **task["kwargs"])
-        except Exception as e:
-            logger.exception(f"Upload worker failed: {e}")
-        finally:
-            upload_queue.task_done()
+async def main():
+    # ✅ Workers yahan start karo (event loop ready hai)
+    for _ in range(2):
+        worker_tasks.append(asyncio.create_task(upload_worker()))
+    
+    await ensure_indexes()
+    await dp.start_polling(bot)
 
 # Start workers
 for _ in range(2):  # two concurrent workers
