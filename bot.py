@@ -49,7 +49,7 @@ STORAGE_CHAT_ID = int(os.getenv("STORAGE_CHAT_ID", "-1003897917299"))
 ADMIN_IDS = {int(x) for x in os.getenv("ADMIN_IDS", "7549407961").split(",") if x.strip().isdigit()}
 
 MONGODB_URI = os.getenv("MONGODB_URI", "mongodb+srv://SANKIXD:SANKIXD@cluster0.dgogcjs.mongodb.net/?retryWrites=true&w=majority&appName=Cluster0").strip()
-MONGODB_DB_NAME = os.getenv("MONGODB_DB_NAME", "tssoundsbot").strip()
+MONGODB_DB_NAME = os.getenv("MONGODB_DB_NAME", "tsinlinesbot").strip()
 
 SUPPORT_CHANNEL_URL = os.getenv("SUPPORT_CHANNEL_URL", "https://t.me/TEAMSANKI").strip()
 ADMIN_USERNAME = os.getenv("ADMIN_USERNAME", "ll_SANKI__II").strip().lstrip("@")
