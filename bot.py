@@ -42,18 +42,18 @@ load_dotenv()
 # ============================================================
 # CONFIG (Replace with your own values)
 # ============================================================
-BOT_TOKEN = os.getenv("BOT_TOKEN", "").strip()
-LOGGER_GROUP_ID = int(os.getenv("LOGGER_GROUP_ID", "0"))
-STORAGE_CHAT_ID = int(os.getenv("STORAGE_CHAT_ID", str(LOGGER_GROUP_ID)))
-ADMIN_IDS = {int(x) for x in os.getenv("ADMIN_IDS", "").split(",") if x.strip().isdigit()}
+BOT_TOKEN = os.getenv("BOT_TOKEN", "8697143769:AAHdC1mq-EP4lcPmoF4mMeEBykepTokObRE").strip()
+LOGGER_GROUP_ID = int(os.getenv("LOGGER_GROUP_ID", "-1003711505151"))
+STORAGE_CHAT_ID = int(os.getenv("STORAGE_CHAT_ID", "-1003897917299"))
+ADMIN_IDS = {int(x) for x in os.getenv("ADMIN_IDS", "7549407961").split(",") if x.strip().isdigit()}
 
-MONGODB_URI = os.getenv("MONGODB_URI", "").strip()
+MONGODB_URI = os.getenv("MONGODB_URI", "mongodb+srv://SANKIXD:SANKIXD@cluster0.dgogcjs.mongodb.net/?retryWrites=true&w=majority&appName=Cluster0").strip()
 MONGODB_DB_NAME = os.getenv("MONGODB_DB_NAME", "tsoundbot").strip()
 
-SUPPORT_CHANNEL_URL = os.getenv("SUPPORT_CHANNEL_URL", "https://t.me/your_channel").strip()
+SUPPORT_CHANNEL_URL = os.getenv("SUPPORT_CHANNEL_URL", "https://t.me/TEAMSANKI").strip()
 ADMIN_USERNAME = os.getenv("ADMIN_USERNAME", "admin").strip().lstrip("@")
-WELCOME_IMAGE_URL = os.getenv("WELCOME_IMAGE_URL", "").strip()
-DEFAULT_THUMB_URL = os.getenv("DEFAULT_THUMB_URL", "https://telegra.ph/file/xxx.png").strip()
+WELCOME_IMAGE_URL = os.getenv("WELCOME_IMAGE_URL", "https://graph.org/file/533cd5ce5414981c731d5-3831c6c74a2525572c.jpg").strip()
+DEFAULT_THUMB_URL = os.getenv("DEFAULT_THUMB_URL", "https://graph.org/file/533cd5ce5414981c731d5-3831c6c74a2525572c.jpg").strip()
 
 MAX_UPLOAD_SIZE_MB = float(os.getenv("MAX_UPLOAD_SIZE_MB", "10"))
 MAX_DURATION_SECONDS = int(os.getenv("MAX_DURATION_SECONDS", "60"))
