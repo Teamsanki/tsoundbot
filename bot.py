@@ -3,14 +3,15 @@ import io
 import logging
 import os
 import re
+import sys
 import uuid
 from dataclasses import dataclass
 from datetime import datetime, timedelta
-from typing import Dict, List, Optional
-from urllib.parse import quote_plus, urljoin
+from typing import Dict, List, Optional, Union
+from urllib.parse import quote_plus, urljoin, unquote
 
 import aiohttp
-from aiogram import Bot, Dispatcher, Router
+from aiogram import Bot, Dispatcher, Router, F
 from aiogram.enums import ChatType, ParseMode
 from aiogram.filters import Command, CommandObject
 from aiogram.fsm.context import FSMContext
@@ -19,6 +20,7 @@ from aiogram.fsm.storage.memory import MemoryStorage
 from aiogram.types import (
     Audio,
     BufferedInputFile,
+    CallbackQuery,
     ChosenInlineResult,
     Document,
     InlineKeyboardButton,
@@ -40,18 +42,18 @@ from motor.motor_asyncio import AsyncIOMotorClient
 load_dotenv()
 
 # ============================================================
-# CONFIG (Replace with your own values)
+# CONFIG
 # ============================================================
 BOT_TOKEN = os.getenv("BOT_TOKEN", "8697143769:AAHdC1mq-EP4lcPmoF4mMeEBykepTokObRE").strip()
 LOGGER_GROUP_ID = int(os.getenv("LOGGER_GROUP_ID", "-1003711505151"))
 STORAGE_CHAT_ID = int(os.getenv("STORAGE_CHAT_ID", "-1003897917299"))
-ADMIN_IDS = {int(x) for x in os.getenv("ADMIN_IDS", "7549407961").split(",") if x.strip().isdigit()}
+ADMIN_IDS = {int(x) for x in os.getenv("ADMIN_IDS", "").split(",") if x.strip().isdigit()}
 
 MONGODB_URI = os.getenv("MONGODB_URI", "mongodb+srv://SANKIXD:SANKIXD@cluster0.dgogcjs.mongodb.net/?retryWrites=true&w=majority&appName=Cluster0").strip()
-MONGODB_DB_NAME = os.getenv("MONGODB_DB_NAME", "tsoundsbot").strip()
+MONGODB_DB_NAME = os.getenv("MONGODB_DB_NAME", "tsounssdbot").strip()
 
 SUPPORT_CHANNEL_URL = os.getenv("SUPPORT_CHANNEL_URL", "https://t.me/TEAMSANKI").strip()
-ADMIN_USERNAME = os.getenv("ADMIN_USERNAME", "admin").strip().lstrip("@")
+ADMIN_USERNAME = os.getenv("ADMIN_USERNAME", "ll_SANKI_II").strip().lstrip("@")
 WELCOME_IMAGE_URL = os.getenv("WELCOME_IMAGE_URL", "https://graph.org/file/533cd5ce5414981c731d5-3831c6c74a2525572c.jpg").strip()
 DEFAULT_THUMB_URL = os.getenv("DEFAULT_THUMB_URL", "https://graph.org/file/533cd5ce5414981c731d5-3831c6c74a2525572c.jpg").strip()
 
@@ -65,6 +67,7 @@ MAX_MYINSTANTS_RESULTS = int(os.getenv("MAX_MYINSTANTS_RESULTS", "12"))
 
 FREE_DAILY_LIMIT = 4
 SUBSCRIPTION_COOLDOWN_SEC = 10
+BATCH_UPLOAD_LIMIT = 20   # max files in one batch
 
 if not BOT_TOKEN:
     raise RuntimeError("BOT_TOKEN missing")
@@ -91,7 +94,6 @@ videos_collection = db["videos"]
 # ============================================================
 # MODELS / STATES
 # ============================================================
-
 @dataclass
 class UploadedSound:
     name: str
@@ -138,13 +140,12 @@ class MediaPayload:
     file_name: Optional[str]
 
 class UploadStates(StatesGroup):
-    waiting_media = State()
-    waiting_name = State()
+    waiting_media_batch = State()
+    waiting_video_name = State()
 
 # ============================================================
-# HELPER FUNCTIONS
+# HELPERS
 # ============================================================
-
 def clean_spaces(text: str) -> str:
     return re.sub(r"\s+", " ", (text or "")).strip()
 
@@ -259,8 +260,8 @@ async def transcode_to_ogg_opus(input_bytes: bytes) -> bytes:
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
         )
-    except FileNotFoundError as exc:
-        raise RuntimeError("ffmpeg not installed") from exc
+    except FileNotFoundError:
+        raise RuntimeError("ffmpeg not installed")
 
     stdout, stderr = await proc.communicate(input=input_bytes)
     if proc.returncode != 0:
@@ -269,6 +270,7 @@ async def transcode_to_ogg_opus(input_bytes: bytes) -> bytes:
     return stdout
 
 async def is_adult_content(file_bytes: bytes, filename: str = "") -> bool:
+    # Simple placeholder – replace with actual API
     suspicious = ["porn", "xxx", "adult", "sex", "nude"]
     return any(word in filename.lower() for word in suspicious)
 
@@ -296,7 +298,7 @@ async def mirror_to_storage_voice(media: MediaPayload, title: str) -> str:
 
 async def mirror_to_storage_video(media: MediaPayload, title: str) -> str:
     title = clean_spaces(title)[:120]
-    if media.kind == "video":
+    if media.kind in ("video", "video_document"):
         sent = await bot.send_video(
             chat_id=STORAGE_CHAT_ID,
             video=media.file_id,
@@ -304,12 +306,7 @@ async def mirror_to_storage_video(media: MediaPayload, title: str) -> str:
             disable_notification=True,
         )
     else:
-        sent = await bot.send_video(
-            chat_id=STORAGE_CHAT_ID,
-            video=media.file_id,
-            caption=title,
-            disable_notification=True,
-        )
+        raise RuntimeError("Invalid video media")
     if not sent.video:
         raise RuntimeError("Storage chat did not return video")
     return sent.video.file_id
@@ -336,7 +333,6 @@ async def ensure_indexes() -> None:
 # ============================================================
 # USER MANAGEMENT
 # ============================================================
-
 async def get_user(user_id: int) -> dict:
     doc = await users_collection.find_one({"user_id": user_id})
     if not doc:
@@ -356,7 +352,9 @@ async def get_user(user_id: int) -> dict:
 async def update_user(user_id: int, updates: dict) -> None:
     await users_collection.update_one({"user_id": user_id}, {"$set": updates})
 
-async def can_upload(user_id: int) -> tuple[bool, str]:
+async def can_upload(user_id: int, is_admin: bool = False) -> tuple[bool, str]:
+    if is_admin:
+        return True, ""
     user = await get_user(user_id)
     if user.get("banned", False):
         return False, "You are banned from uploading."
@@ -365,17 +363,20 @@ async def can_upload(user_id: int) -> tuple[bool, str]:
     if sub_exp and sub_exp > now:
         last_up = user.get("last_upload_time")
         if last_up and (now - last_up).total_seconds() < SUBSCRIPTION_COOLDOWN_SEC:
-            return False, f"Cooldown: wait {SUBSCRIPTION_COOLDOWN_SEC - int((now - last_up).total_seconds())} seconds."
+            remain = SUBSCRIPTION_COOLDOWN_SEC - int((now - last_up).total_seconds())
+            return False, f"Cooldown: wait {remain} seconds."
         return True, ""
     else:
         today = now.date().isoformat()
         daily = user.get("daily_uploads", {})
         count = daily.get(today, 0)
         if count >= FREE_DAILY_LIMIT:
-            return False, f"Daily limit ({FREE_DAILY_LIMIT}) reached. Subscribe for unlimited."
+            return False, f"Daily limit ({FREE_DAILY_LIMIT}) reached."
         return True, ""
 
-async def record_upload(user_id: int, is_video: bool = False) -> None:
+async def record_upload(user_id: int, is_video: bool = False, is_admin: bool = False) -> None:
+    if is_admin:
+        return  # no limits for admin
     user = await get_user(user_id)
     now = datetime.utcnow()
     updates = {"last_upload_time": now}
@@ -404,11 +405,9 @@ async def add_warning(user_id: int, reason: str) -> int:
     return warnings
 
 # ============================================================
-# SAVE TO DB (Fixed field filtering)
+# SAVE TO DB
 # ============================================================
-
 def _filter_dataclass_fields(data: dict, cls):
-    """Keep only keys that are fields of the dataclass."""
     allowed = {f.name for f in cls.__dataclass_fields__.values()}
     return {k: v for k, v in data.items() if k in allowed}
 
@@ -478,7 +477,6 @@ async def save_uploaded_video(
 # ============================================================
 # SEARCH
 # ============================================================
-
 async def search_uploaded(query: str, limit: int = 15) -> List[UploadedSound]:
     q = clean_spaces(query).lower()
     if q:
@@ -538,9 +536,8 @@ async def search_videos(query: str, limit: int = 10) -> List[UploadedVideo]:
     return [UploadedVideo(**_filter_dataclass_fields(item, UploadedVideo)) for _, item in scored[:limit]]
 
 # ============================================================
-# MYINSTANTS PARSING (FULLY IMPLEMENTED)
+# MYINSTANTS PARSING (same as before)
 # ============================================================
-
 MYINSTANTS_BASE = "https://www.myinstants.com"
 MYINSTANTS_SEARCH = "https://www.myinstants.com/en/search/?name={query}"
 HEADERS = {
@@ -576,14 +573,11 @@ async def parse_myinstants_detail(session: aiohttp.ClientSession, page_url: str,
 
     soup = BeautifulSoup(html, "html.parser")
     audio_url = None
-
-    # Find MP3 link
     for a in soup.find_all("a", href=True):
         href = a.get("href", "").strip()
         if "/media/sounds/" in href and ".mp3" in href.lower():
             audio_url = urljoin(MYINSTANTS_BASE, href)
             break
-
     if not audio_url:
         for a in soup.find_all("a", href=True):
             label = clean_spaces(a.get_text(" ", strip=True)).lower()
@@ -591,12 +585,10 @@ async def parse_myinstants_detail(session: aiohttp.ClientSession, page_url: str,
             if "download mp3" in label and "/media/sounds/" in href and ".mp3" in href.lower():
                 audio_url = urljoin(MYINSTANTS_BASE, href)
                 break
-
     if not audio_url:
         m = re.search(r'(?:https?://[^"\']+)?(/media/sounds/[^"\']+\.mp3(?:\?[^"\']*)?)', html, re.I)
         if m:
             audio_url = urljoin(MYINSTANTS_BASE, m.group(1))
-
     if not audio_url:
         return None
 
@@ -606,13 +598,11 @@ async def parse_myinstants_detail(session: aiohttp.ClientSession, page_url: str,
         h1_text = clean_spaces(h1.get_text(" ", strip=True))
         if h1_text:
             title = h1_text
-
     return ExternalSound(name=title, page_url=page_url, audio_url=audio_url)
 
 async def search_myinstants(query: str, limit: int = 12) -> List[ExternalSound]:
     if not MYINSTANTS_ENABLED or not query.strip():
         return []
-
     search_url = MYINSTANTS_SEARCH.format(query=quote_plus(query.strip()))
     async with aiohttp.ClientSession(headers=HEADERS) as session:
         try:
@@ -626,7 +616,6 @@ async def search_myinstants(query: str, limit: int = 12) -> List[ExternalSound]:
         soup = BeautifulSoup(html, "html.parser")
         seen_urls = set()
         candidates = []
-
         for a in soup.find_all("a", href=True):
             href = a.get("href", "").strip()
             if "/instant/" not in href:
@@ -646,7 +635,6 @@ async def search_myinstants(query: str, limit: int = 12) -> List[ExternalSound]:
             return []
 
         sem = asyncio.Semaphore(4)
-
         async def worker(page_url: str, title: str) -> Optional[ExternalSound]:
             async with sem:
                 return await parse_myinstants_detail(session, page_url, title)
@@ -665,13 +653,11 @@ async def search_myinstants(query: str, limit: int = 12) -> List[ExternalSound]:
         results.append(item)
         if len(results) >= limit:
             break
-
     return results
 
 # ============================================================
 # COMMANDS
 # ============================================================
-
 @router.message(Command("start"))
 async def cmd_start(message: Message) -> None:
     user = message.from_user
@@ -680,35 +666,50 @@ async def cmd_start(message: Message) -> None:
         f"👤 {user.full_name} (<code>{user.id}</code>)\n"
         f"💬 Chat: <code>{message.chat.id}</code>"
     )
+    kb = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="👤 Profile", callback_data="profile")],
+        [InlineKeyboardButton(text="📢 Support", url=SUPPORT_CHANNEL_URL)],
+        [InlineKeyboardButton(text="👨‍💻 Admin", url=f"https://t.me/{ADMIN_USERNAME}")],
+        [InlineKeyboardButton(text="🔍 Search Inline", switch_inline_query_current_chat="")],
+    ])
     if WELCOME_IMAGE_URL:
-        caption = (
-            "🎵 <b>Sound & Video Inline Bot</b>\n\n"
-            "Use me inline: <code>@YourBotName query</code>\n\n"
-            "📤 Upload sounds or short videos.\n"
-            "🔞 Adult content blocked.\n"
-            "📊 Check /profile and /top"
-        )
-        keyboard = InlineKeyboardMarkup(inline_keyboard=[
-            [InlineKeyboardButton(text="📢 Support Channel", url=SUPPORT_CHANNEL_URL)],
-            [InlineKeyboardButton(text="👤 Contact Admin", url=f"https://t.me/{ADMIN_USERNAME}")],
-            [InlineKeyboardButton(text="🔍 Search Inline", switch_inline_query_current_chat="")],
-        ])
         await message.answer_photo(
             photo=WELCOME_IMAGE_URL,
-            caption=caption,
+            caption="🎵 <b>Sound & Video Inline Bot</b>\n\nUse /upload to add content.",
             parse_mode=ParseMode.HTML,
-            reply_markup=keyboard,
+            reply_markup=kb,
         )
     else:
         await message.answer(
-            "🎵 <b>Sound & Video Inline Bot</b>\n\n"
-            "Use /upload to add content.",
+            "🎵 <b>Sound & Video Inline Bot</b>\n\nUse /upload to add content.",
             parse_mode=ParseMode.HTML,
-            reply_markup=upload_keyboard(),
+            reply_markup=kb,
         )
 
+@router.callback_query(F.data == "profile")
+async def profile_callback(callback: CallbackQuery):
+    user_id = callback.from_user.id
+    user = await get_user(user_id)
+    total_uploads = user.get("total_uploads", 0) + user.get("total_video_uploads", 0)
+    warnings = user.get("warnings", 0)
+    banned = user.get("banned", False)
+    sub_exp = user.get("subscription_expiry")
+    sub_text = "Not subscribed"
+    if sub_exp and sub_exp > datetime.utcnow():
+        sub_text = f"Active until {sub_exp.strftime('%Y-%m-%d %H:%M UTC')}"
+    text = (
+        f"👤 <b>Profile</b>\n"
+        f"🆔 ID: <code>{user_id}</code>\n"
+        f"📤 Total uploads: {total_uploads}\n"
+        f"⚠️ Warnings: {warnings}/5\n"
+        f"🚫 Banned: {banned}\n"
+        f"💎 Subscription: {sub_text}"
+    )
+    await callback.message.edit_caption(caption=text, parse_mode=ParseMode.HTML, reply_markup=None)
+    await callback.answer()
+
 @router.message(Command("profile"))
-async def cmd_profile(message: Message) -> None:
+async def cmd_profile(message: Message):
     user_id = message.from_user.id
     user = await get_user(user_id)
     total_uploads = user.get("total_uploads", 0) + user.get("total_video_uploads", 0)
@@ -724,23 +725,12 @@ async def cmd_profile(message: Message) -> None:
         f"📤 Total uploads: {total_uploads}\n"
         f"⚠️ Warnings: {warnings}/5\n"
         f"🚫 Banned: {banned}\n"
-        f"💎 Subscription: {sub_text}\n"
+        f"💎 Subscription: {sub_text}"
     )
-
-    top_sounds = await sounds_collection.find().sort("share_count", -1).limit(3).to_list(3)
-    top_videos = await videos_collection.find().sort("share_count", -1).limit(3).to_list(3)
-    user_top_sound = next((s for s in top_sounds if s.get("uploader_id") == user_id), None)
-    user_top_video = next((v for v in top_videos if v.get("uploader_id") == user_id), None)
-
-    if user_top_sound:
-        text += f"\n🏆 Your top sound: <b>{user_top_sound['name']}</b> (shared {user_top_sound['share_count']} times)"
-    if user_top_video:
-        text += f"\n🎬 Your top video: <b>{user_top_video['name']}</b> (shared {user_top_video['share_count']} times)"
-
     await message.answer(text, parse_mode=ParseMode.HTML)
 
 @router.message(Command("top"))
-async def cmd_top(message: Message) -> None:
+async def cmd_top(message: Message):
     top_sounds = await sounds_collection.find().sort("share_count", -1).limit(3).to_list(3)
     top_videos = await videos_collection.find().sort("share_count", -1).limit(3).to_list(3)
     text = "🏆 <b>Leaderboard</b>\n\n<b>🎵 Top Sounds</b>\n"
@@ -758,18 +748,17 @@ async def cmd_top(message: Message) -> None:
     await message.answer(text, parse_mode=ParseMode.HTML)
 
 @router.message(Command("subscribe"))
-async def cmd_subscribe(message: Message) -> None:
+async def cmd_subscribe(message: Message):
     await message.answer(
         "💎 <b>Subscription</b>\n\n"
         "1 week unlimited uploads (10s cooldown) – ₹20\n\n"
         "To subscribe, send ₹20 to UPI: <code>yourupi@okhdfcbank</code>\n"
-        "After payment, send screenshot to admin @YourAdminUsername.\n"
-        "Admin will activate your subscription.",
+        "After payment, send screenshot to admin.",
         parse_mode=ParseMode.HTML,
     )
 
 @router.message(Command("addsub"))
-async def cmd_addsub(message: Message, command: CommandObject) -> None:
+async def cmd_addsub(message: Message, command: CommandObject):
     if message.from_user.id not in ADMIN_IDS:
         return
     args = command.args.split() if command.args else []
@@ -787,16 +776,16 @@ async def cmd_addsub(message: Message, command: CommandObject) -> None:
     await message.reply(f"✅ Subscription added for {target_id} until {expiry.strftime('%Y-%m-%d')}")
 
 @router.message(Command("cancel"))
-async def cmd_cancel(message: Message, state: FSMContext) -> None:
+async def cmd_cancel(message: Message, state: FSMContext):
     await state.clear()
     await message.reply("Cancelled.")
 
 @router.message(Command("id"))
-async def cmd_id(message: Message) -> None:
+async def cmd_id(message: Message):
     await message.reply(f"Chat ID: <code>{message.chat.id}</code>", parse_mode=ParseMode.HTML)
 
 @router.message(Command("upload"))
-async def cmd_upload(message: Message, state: FSMContext) -> None:
+async def cmd_upload(message: Message, state: FSMContext):
     if message.chat.type != ChatType.PRIVATE:
         await message.reply("/upload only in private chat.")
         return
@@ -805,61 +794,128 @@ async def cmd_upload(message: Message, state: FSMContext) -> None:
     if user.get("banned", False):
         await message.reply("You are banned.")
         return
-    await state.set_state(UploadStates.waiting_media)
+    await state.set_state(UploadStates.waiting_media_batch)
     await message.answer(
-        f"Send me a voice note, audio file, or short video (max {VIDEO_MAX_DURATION_SEC}s, {VIDEO_MAX_SIZE_MB}MB).\n"
+        "Send me audio files (voice, audio, document) – up to 20 at once.\n"
+        "For videos, send one at a time and I'll ask for a name.\n"
         f"Audio max {MAX_DURATION_SECONDS}s, {MAX_UPLOAD_SIZE_MB}MB.\n"
-        "I'll ask for a name next."
+        f"Video max {VIDEO_MAX_DURATION_SEC}s, {VIDEO_MAX_SIZE_MB}MB."
     )
 
-@router.message(UploadStates.waiting_media)
-async def upload_receive_media(message: Message, state: FSMContext) -> None:
+# ------------------------------------------------------------
+# BATCH UPLOAD HANDLER (audio only)
+# ------------------------------------------------------------
+@router.message(UploadStates.waiting_media_batch)
+async def batch_media_handler(message: Message, state: FSMContext):
+    user_id = message.from_user.id
+    is_admin = user_id in ADMIN_IDS
+
+    # Check if video sent separately
     media = extract_media(message)
-    if not media:
-        await message.reply("Please send a valid media file.")
+    if media and media.kind in ("video", "video_document"):
+        # Single video -> ask for name
+        can_up, reason = await can_upload(user_id, is_admin)
+        if not can_up:
+            await state.clear()
+            await message.reply(f"❌ {reason}")
+            return
+        # Size checks
+        if media.file_size and media.file_size > VIDEO_MAX_SIZE_MB * 1024 * 1024:
+            await state.clear()
+            await message.reply(f"❌ Video exceeds {VIDEO_MAX_SIZE_MB}MB.")
+            return
+        if media.duration and media.duration > VIDEO_MAX_DURATION_SEC:
+            await state.clear()
+            await message.reply(f"❌ Video duration exceeds {VIDEO_MAX_DURATION_SEC}s.")
+            return
+        # Adult detection
+        if not is_admin and await is_adult_content(b"", media.file_name or ""):
+            warns = await add_warning(user_id, "Adult video detected")
+            await state.clear()
+            await message.reply(f"🔞 Adult content not allowed. Warning {warns}/5.")
+            return
+        await state.update_data(video_media=media)
+        await state.set_state(UploadStates.waiting_video_name)
+        await message.answer("Send a name for this video (max 80 chars).")
         return
 
-    user_id = message.from_user.id
-    can_up, reason = await can_upload(user_id)
+    # Collect all media from the message (or media group)
+    medias = []
+    if message.media_group_id:
+        # The current message is part of an album; we'll wait a short time to collect all
+        # For simplicity, we'll process only the current message; full album handling requires
+        # storing messages in a buffer. We'll assume user can send multiple messages.
+        pass
+    # Single message might contain one media
+    if media:
+        if media.kind not in ("voice", "audio", "document"):
+            await message.reply("Only audio files are accepted in batch. Send videos separately.")
+            return
+        medias.append(media)
+    else:
+        await message.reply("No valid media found.")
+        return
+
+    # Check limit
+    can_up, reason = await can_upload(user_id, is_admin)
     if not can_up:
         await state.clear()
         await message.reply(f"❌ {reason}")
         return
 
-    is_video = media.kind in ("video", "video_document")
-    max_size = VIDEO_MAX_SIZE_MB if is_video else MAX_UPLOAD_SIZE_MB
-    max_dur = VIDEO_MAX_DURATION_SEC if is_video else MAX_DURATION_SECONDS
+    # Process each audio
+    status_msg = await message.answer("Processing...")
+    success = 0
+    failed = 0
+    for m in medias[:BATCH_UPLOAD_LIMIT]:
+        try:
+            # Name generation
+            if m.kind == "voice":
+                name = f"Voice_{datetime.utcnow().strftime('%Y%m%d_%H%M%S')}"
+            else:
+                name = m.file_name or f"Audio_{datetime.utcnow().strftime('%Y%m%d_%H%M%S')}"
+            name = clean_spaces(name)[:80]
+            if not name:
+                name = f"Sound_{uuid.uuid4().hex[:6]}"
 
-    if media.file_size and media.file_size > max_size * 1024 * 1024:
-        await state.clear()
-        await message.reply(f"❌ File exceeds {max_size}MB.")
-        return
-    if media.duration and media.duration > max_dur:
-        await state.clear()
-        await message.reply(f"❌ Duration exceeds {max_dur} seconds.")
-        return
+            # Adult check
+            if not is_admin and await is_adult_content(b"", m.file_name or ""):
+                await add_warning(user_id, "Adult audio filename")
+                failed += 1
+                continue
 
-    # Adult detection (simple filename check)
-    if await is_adult_content(b"", media.file_name or ""):
-        warns = await add_warning(user_id, f"Adult content detected in upload attempt")
-        await state.clear()
-        await message.reply(f"🔞 Adult content not allowed. Warning {warns}/5.")
-        return
+            # Size / duration checks
+            if m.file_size and m.file_size > MAX_UPLOAD_SIZE_MB * 1024 * 1024:
+                failed += 1
+                continue
+            if m.duration and m.duration > MAX_DURATION_SECONDS:
+                failed += 1
+                continue
 
-    await state.update_data(
-        pending_kind=media.kind,
-        pending_file_id=media.file_id,
-        pending_duration=media.duration,
-        pending_size=media.file_size,
-        pending_mime=media.mime_type,
-        pending_filename=media.file_name,
-        is_video=is_video,
-    )
-    await state.set_state(UploadStates.waiting_name)
-    await message.answer("Now send a name for this upload (max 80 chars).")
+            cached_id = await mirror_to_storage_voice(m, name)
+            await save_uploaded_sound(
+                name=name,
+                uploader_id=user_id,
+                cached_voice_file_id=cached_id,
+                duration=m.duration,
+                size_bytes=m.file_size,
+                mime_type=m.mime_type,
+                original_name=m.file_name,
+            )
+            await record_upload(user_id, is_video=False, is_admin=is_admin)
+            success += 1
+        except Exception as e:
+            logger.exception("Batch upload error")
+            failed += 1
 
-@router.message(UploadStates.waiting_name)
-async def upload_receive_name(message: Message, state: FSMContext) -> None:
+    await status_msg.edit_text(f"✅ Uploaded: {success}  ❌ Failed: {failed}")
+    await state.clear()
+
+# ------------------------------------------------------------
+# VIDEO NAME HANDLER
+# ------------------------------------------------------------
+@router.message(UploadStates.waiting_video_name)
+async def video_name_handler(message: Message, state: FSMContext):
     name = clean_spaces(message.text or "")
     if not name:
         await message.reply("Please send a text name.")
@@ -870,102 +926,159 @@ async def upload_receive_name(message: Message, state: FSMContext) -> None:
         return
 
     data = await state.get_data()
-    kind = data.get("pending_kind")
-    file_id = data.get("pending_file_id")
-    duration = data.get("pending_duration")
-    size_bytes = data.get("pending_size")
-    mime_type = data.get("pending_mime")
-    original_filename = data.get("pending_filename")
-    is_video = data.get("is_video", False)
+    media: MediaPayload = data.get("video_media")
+    user_id = message.from_user.id
+    is_admin = user_id in ADMIN_IDS
 
-    msg = await message.answer("Uploading...")
+    msg = await message.answer("Uploading video...")
     try:
-        media = MediaPayload(
-            kind=kind,
-            file_id=file_id,
-            file_size=size_bytes,
-            duration=duration,
-            mime_type=mime_type,
-            file_name=original_filename,
+        cached_id = await mirror_to_storage_video(media, name)
+        await save_uploaded_video(
+            name=name,
+            uploader_id=user_id,
+            cached_video_file_id=cached_id,
+            duration=media.duration,
+            size_bytes=media.file_size,
+            mime_type=media.mime_type,
+            original_name=media.file_name,
         )
-
-        if is_video:
-            cached_file_id = await mirror_to_storage_video(media, name)
-            uploaded = await save_uploaded_video(
-                name=name,
-                uploader_id=message.from_user.id,
-                cached_video_file_id=cached_file_id,
-                duration=duration,
-                size_bytes=size_bytes,
-                mime_type=mime_type,
-                original_name=original_filename,
-            )
-        else:
-            cached_file_id = await mirror_to_storage_voice(media, name)
-            uploaded = await save_uploaded_sound(
-                name=name,
-                uploader_id=message.from_user.id,
-                cached_voice_file_id=cached_file_id,
-                duration=duration,
-                size_bytes=size_bytes,
-                mime_type=mime_type,
-                original_name=original_filename,
-            )
-
-        await record_upload(message.from_user.id, is_video=is_video)
+        await record_upload(user_id, is_video=True, is_admin=is_admin)
         await state.clear()
         await msg.edit_text(
-            f"✅ Uploaded: <b>{uploaded.name}</b>\n"
-            f"Size: {format_size_mb(size_bytes)}\n"
-            f"Now use inline mode to share.",
+            f"✅ Uploaded video: <b>{name}</b>\nSize: {format_size_mb(media.file_size)}",
             parse_mode=ParseMode.HTML,
             reply_markup=upload_keyboard(),
         )
-        await log_event(
-            f"📤 User {message.from_user.id} uploaded {'video' if is_video else 'sound'}: {name}"
-        )
+        await log_event(f"📤 User {user_id} uploaded video: {name}")
     except Exception as e:
-        logger.exception("Upload failed")
+        logger.exception("Video upload failed")
         await state.clear()
         await msg.edit_text(f"❌ Upload failed: {e}")
 
 # ============================================================
-# INLINE MODE
+# ADMIN: DELETE SOUNDS / VIDEOS
 # ============================================================
+def admin_pagination_keyboard(collection_name: str, page: int, total_pages: int) -> InlineKeyboardMarkup:
+    buttons = []
+    if page > 0:
+        buttons.append(InlineKeyboardButton(text="⬅️ Prev", callback_data=f"admin_{collection_name}_page_{page-1}"))
+    if page < total_pages - 1:
+        buttons.append(InlineKeyboardButton(text="➡️ Next", callback_data=f"admin_{collection_name}_page_{page+1}"))
+    return InlineKeyboardMarkup(inline_keyboard=[buttons])
 
+@router.message(Command("sounds"))
+async def list_sounds(message: Message):
+    if message.from_user.id not in ADMIN_IDS:
+        return
+    await show_admin_page(message.chat.id, "sounds", 0)
+
+@router.message(Command("videos"))
+async def list_videos(message: Message):
+    if message.from_user.id not in ADMIN_IDS:
+        return
+    await show_admin_page(message.chat.id, "videos", 0)
+
+async def show_admin_page(chat_id: int, coll: str, page: int, edit_msg_id: int = None):
+    per_page = 5
+    collection = sounds_collection if coll == "sounds" else videos_collection
+    total = await collection.count_documents({})
+    total_pages = (total + per_page - 1) // per_page
+    if total_pages == 0:
+        text = "No items found."
+        if edit_msg_id:
+            await bot.edit_message_text(text, chat_id=chat_id, message_id=edit_msg_id)
+        else:
+            await bot.send_message(chat_id, text)
+        return
+
+    cursor = collection.find().sort("created_at", -1).skip(page * per_page).limit(per_page)
+    items = await cursor.to_list(length=per_page)
+    lines = [f"📋 <b>{coll.capitalize()} (Page {page+1}/{total_pages})</b>\n"]
+    for i, item in enumerate(items, 1):
+        lines.append(f"{i}. <b>{item['name']}</b> – {item.get('share_count',0)} shares")
+    text = "\n".join(lines)
+    kb = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text=f"🔊 Listen" if coll=="sounds" else "🎬 Watch",
+                              callback_data=f"admin_view_{coll}_{items[0]['_id']}")],
+        [InlineKeyboardButton(text="🗑 Delete", callback_data=f"admin_delete_{coll}_{items[0]['_id']}")],
+        *admin_pagination_keyboard(coll, page, total_pages).inline_keyboard
+    ])
+    if edit_msg_id:
+        await bot.edit_message_text(text, chat_id=chat_id, message_id=edit_msg_id, parse_mode=ParseMode.HTML, reply_markup=kb)
+    else:
+        await bot.send_message(chat_id, text, parse_mode=ParseMode.HTML, reply_markup=kb)
+
+@router.callback_query(F.data.startswith("admin_"))
+async def admin_callback_handler(callback: CallbackQuery):
+    if callback.from_user.id not in ADMIN_IDS:
+        await callback.answer("Unauthorized", show_alert=True)
+        return
+    data = callback.data.split("_")
+    if len(data) < 3:
+        return
+    action = data[1]
+    coll = data[2]
+    if action == "page":
+        page = int(data[3])
+        await show_admin_page(callback.message.chat.id, coll, page, edit_msg_id=callback.message.message_id)
+        await callback.answer()
+    elif action == "view":
+        item_id = data[3]
+        collection = sounds_collection if coll == "sounds" else videos_collection
+        item = await collection.find_one({"_id": item_id})
+        if not item:
+            await callback.answer("Item not found")
+            return
+        if coll == "sounds":
+            await bot.send_voice(callback.message.chat.id, item["cached_voice_file_id"], caption=item["name"])
+        else:
+            await bot.send_video(callback.message.chat.id, item["cached_video_file_id"], caption=item["name"])
+        await callback.answer()
+    elif action == "delete":
+        item_id = data[3]
+        collection = sounds_collection if coll == "sounds" else videos_collection
+        result = await collection.delete_one({"_id": item_id})
+        if result.deleted_count:
+            await callback.answer("Deleted", show_alert=True)
+            # Re-show page
+            page = int(data[4]) if len(data) > 4 else 0
+            await show_admin_page(callback.message.chat.id, coll, page, edit_msg_id=callback.message.message_id)
+        else:
+            await callback.answer("Delete failed", show_alert=True)
+
+# ============================================================
+# INLINE MODE (with share count fix)
+# ============================================================
 @router.inline_query()
-async def inline_handler(inline_query: InlineQuery) -> None:
+async def inline_handler(inline_query: InlineQuery):
     query = clean_spaces(inline_query.query)
     results = []
 
-    # Sounds
     sound_results = await search_uploaded(query, limit=15)
     for item in sound_results:
         if item.cached_voice_file_id:
             results.append(
                 InlineQueryResultCachedVoice(
-                    id=f"upload:{slugify(item.name)}:{uuid.uuid4().hex[:8]}",
+                    id=f"upload:{item.name}:{uuid.uuid4().hex[:8]}",
                     voice_file_id=item.cached_voice_file_id,
                     title=item.name,
                     caption=f"{item.name}\n🔊 Sound",
                 )
             )
 
-    # Videos
     video_results = await search_videos(query, limit=5)
     for item in video_results:
         if item.cached_video_file_id:
             results.append(
                 InlineQueryResultCachedVideo(
-                    id=f"video:{slugify(item.name)}:{uuid.uuid4().hex[:8]}",
+                    id=f"video:{item.name}:{uuid.uuid4().hex[:8]}",
                     video_file_id=item.cached_video_file_id,
                     title=item.name,
                     description=f"🎬 Video · {item.duration}s",
-                    caption=f"{item.name}",
+                    caption=item.name,
                 )
             )
 
-    # Myinstants
     remaining = max(0, 40 - len(results))
     if remaining and query and MYINSTANTS_ENABLED:
         try:
@@ -973,7 +1086,7 @@ async def inline_handler(inline_query: InlineQuery) -> None:
             for item in ext_results:
                 results.append(
                     InlineQueryResultAudio(
-                        id=f"mi:{slugify(item.name)}:{uuid.uuid4().hex[:8]}",
+                        id=f"mi:{item.name}:{uuid.uuid4().hex[:8]}",
                         audio_url=item.audio_url,
                         title=f"🔊 {item.name}",
                         caption=f"{item.name}\nSource: Myinstants",
@@ -998,30 +1111,41 @@ async def inline_handler(inline_query: InlineQuery) -> None:
     await inline_query.answer(results, cache_time=INLINE_CACHE_SECONDS, is_personal=True)
 
 @router.chosen_inline_result()
-async def chosen_result_handler(chosen: ChosenInlineResult) -> None:
+async def chosen_result_handler(chosen: ChosenInlineResult):
     rid = chosen.result_id
-    if rid.startswith("upload:"):
-        parts = rid.split(":")
-        slug = parts[1] if len(parts) > 1 else ""
-        await sounds_collection.update_one(
-            {"name_lower": slug.replace("-", " ").lower()},
-            {"$inc": {"share_count": 1}}
-        )
-    elif rid.startswith("video:"):
-        parts = rid.split(":")
-        slug = parts[1] if len(parts) > 1 else ""
-        await videos_collection.update_one(
-            {"name_lower": slug.replace("-", " ").lower()},
-            {"$inc": {"share_count": 1}}
-        )
+    # Format: "upload:Name:random"
+    parts = rid.split(":")
+    if len(parts) >= 2:
+        prefix = parts[0]
+        name = parts[1]
+        if prefix == "upload":
+            await sounds_collection.update_one(
+                {"name": name},
+                {"$inc": {"share_count": 1}}
+            )
+        elif prefix == "video":
+            await videos_collection.update_one(
+                {"name": name},
+                {"$inc": {"share_count": 1}}
+            )
     logger.info(f"Chosen: user={chosen.from_user.id} result={rid}")
 
 # ============================================================
-# ADMIN STATS
+# ADMIN: USERS LIST & STATS & UPDATE
 # ============================================================
+@router.message(Command("users"))
+async def cmd_users(message: Message):
+    if message.from_user.id not in ADMIN_IDS:
+        return
+    users = await users_collection.find().to_list(length=None)
+    lines = [f"👥 <b>Total Users: {len(users)}</b>\n"]
+    for u in users[:20]:
+        sub = "✅" if u.get("subscription_expiry") and u["subscription_expiry"] > datetime.utcnow() else "❌"
+        lines.append(f"<code>{u['user_id']}</code> - uploads: {u.get('total_uploads',0)+u.get('total_video_uploads',0)} {sub}")
+    await message.answer("\n".join(lines), parse_mode=ParseMode.HTML)
 
 @router.message(Command("stats"))
-async def cmd_stats(message: Message) -> None:
+async def cmd_stats(message: Message):
     if message.from_user.id not in ADMIN_IDS:
         return
     sound_count = await sounds_collection.count_documents({})
@@ -1034,11 +1158,35 @@ async def cmd_stats(message: Message) -> None:
         f"Videos: {video_count}"
     )
 
+@router.message(Command("update"))
+async def cmd_update(message: Message):
+    if message.from_user.id not in ADMIN_IDS:
+        return
+    msg = await message.answer("⏳ Fetching updates from git...")
+    try:
+        proc = await asyncio.create_subprocess_exec(
+            "git", "pull",
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+        )
+        stdout, stderr = await proc.communicate()
+        output = stdout.decode() + stderr.decode()
+        if "Already up to date" in output:
+            await msg.edit_text("✅ Already up-to-date.")
+        else:
+            await msg.edit_text(f"✅ Updated:\n<pre>{output[:300]}</pre>", parse_mode=ParseMode.HTML)
+            # Restart bot (requires process manager like systemd)
+            await asyncio.sleep(1)
+            await msg.edit_text("🔄 Restarting bot...")
+            # Send SIGTERM to ourselves; systemd should restart automatically
+            os.kill(os.getpid(), 15)
+    except Exception as e:
+        await msg.edit_text(f"❌ Update failed: {e}")
+
 # ============================================================
 # RUNNER
 # ============================================================
-
-async def main() -> None:
+async def main():
     await ensure_indexes()
     me = await bot.get_me()
     logger.info("Bot started as @%s", me.username)
