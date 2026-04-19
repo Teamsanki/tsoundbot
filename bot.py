@@ -2,12 +2,13 @@ import asyncio
 import io
 import logging
 import os
+import random
 import re
 import sys
 import uuid
 from dataclasses import dataclass
 from datetime import datetime, timedelta
-from typing import Dict, List, Optional, Union
+from typing import Dict, List, Optional
 from urllib.parse import quote_plus, urljoin, unquote
 
 import aiohttp
@@ -50,14 +51,14 @@ STORAGE_CHAT_ID = int(os.getenv("STORAGE_CHAT_ID", "-1003897917299"))
 ADMIN_IDS = {int(x) for x in os.getenv("ADMIN_IDS", "7549407961").split(",") if x.strip().isdigit()}
 
 MONGODB_URI = os.getenv("MONGODB_URI", "mongodb+srv://SANKIXD:SANKIXD@cluster0.dgogcjs.mongodb.net/?retryWrites=true&w=majority&appName=Cluster0").strip()
-MONGODB_DB_NAME = os.getenv("MONGODB_DB_NAME", "tsounsshdbot").strip()
+MONGODB_DB_NAME = os.getenv("MONGODB_DB_NAME", "tssoundsbot").strip()
 
 SUPPORT_CHANNEL_URL = os.getenv("SUPPORT_CHANNEL_URL", "https://t.me/TEAMSANKI").strip()
 ADMIN_USERNAME = os.getenv("ADMIN_USERNAME", "ll_SANKI_II").strip().lstrip("@")
 WELCOME_IMAGE_URL = os.getenv("WELCOME_IMAGE_URL", "https://graph.org/file/533cd5ce5414981c731d5-3831c6c74a2525572c.jpg").strip()
 DEFAULT_THUMB_URL = os.getenv("DEFAULT_THUMB_URL", "https://graph.org/file/533cd5ce5414981c731d5-3831c6c74a2525572c.jpg").strip()
 
-MAX_UPLOAD_SIZE_MB = float(os.getenv("MAX_UPLOAD_SIZE_MB", "10"))
+MAX_UPLOAD_SIZE_MB = float(os.getenv("MAX_UPLOAD_SIZE_MB", "20"))
 MAX_DURATION_SECONDS = int(os.getenv("MAX_DURATION_SECONDS", "60"))
 VIDEO_MAX_SIZE_MB = float(os.getenv("VIDEO_MAX_SIZE_MB", "20"))
 VIDEO_MAX_DURATION_SEC = int(os.getenv("VIDEO_MAX_DURATION_SEC", "10"))
@@ -67,7 +68,8 @@ MAX_MYINSTANTS_RESULTS = int(os.getenv("MAX_MYINSTANTS_RESULTS", "12"))
 
 FREE_DAILY_LIMIT = 4
 SUBSCRIPTION_COOLDOWN_SEC = 10
-BATCH_UPLOAD_LIMIT = 20   # max files in one batch
+BATCH_AUDIO_LIMIT = 10          # max audio files per batch
+INLINE_RANDOM_LIMIT = 10        # default random sounds shown
 
 if not BOT_TOKEN:
     raise RuntimeError("BOT_TOKEN missing")
@@ -270,7 +272,6 @@ async def transcode_to_ogg_opus(input_bytes: bytes) -> bytes:
     return stdout
 
 async def is_adult_content(file_bytes: bytes, filename: str = "") -> bool:
-    # Simple placeholder – replace with actual API
     suspicious = ["porn", "xxx", "adult", "sex", "nude"]
     return any(word in filename.lower() for word in suspicious)
 
@@ -298,15 +299,12 @@ async def mirror_to_storage_voice(media: MediaPayload, title: str) -> str:
 
 async def mirror_to_storage_video(media: MediaPayload, title: str) -> str:
     title = clean_spaces(title)[:120]
-    if media.kind in ("video", "video_document"):
-        sent = await bot.send_video(
-            chat_id=STORAGE_CHAT_ID,
-            video=media.file_id,
-            caption=title,
-            disable_notification=True,
-        )
-    else:
-        raise RuntimeError("Invalid video media")
+    sent = await bot.send_video(
+        chat_id=STORAGE_CHAT_ID,
+        video=media.file_id,
+        caption=title,
+        disable_notification=True,
+    )
     if not sent.video:
         raise RuntimeError("Storage chat did not return video")
     return sent.video.file_id
@@ -376,7 +374,7 @@ async def can_upload(user_id: int, is_admin: bool = False) -> tuple[bool, str]:
 
 async def record_upload(user_id: int, is_video: bool = False, is_admin: bool = False) -> None:
     if is_admin:
-        return  # no limits for admin
+        return
     user = await get_user(user_id)
     now = datetime.utcnow()
     updates = {"last_upload_time": now}
@@ -475,26 +473,28 @@ async def save_uploaded_video(
     return UploadedVideo(**_filter_dataclass_fields(doc, UploadedVideo))
 
 # ============================================================
-# SEARCH
+# SEARCH (with smart scoring & random fallback)
 # ============================================================
 async def search_uploaded(query: str, limit: int = 15) -> List[UploadedSound]:
     q = clean_spaces(query).lower()
-    if q:
-        docs = await sounds_collection.find(
-            {"name_lower": {"$regex": re.escape(q)}},
-            limit=limit * 5,
-        ).to_list(length=limit * 5)
-    else:
-        docs = await sounds_collection.find({}).sort("created_at", -1).limit(limit).to_list(length=limit)
+    if not q:
+        # Return random sounds
+        pipeline = [{"$sample": {"size": limit}}]
+        docs = await sounds_collection.aggregate(pipeline).to_list(length=limit)
+        return [UploadedSound(**_filter_dataclass_fields(doc, UploadedSound)) for doc in docs]
+
+    # Smart search with scoring
+    docs = await sounds_collection.find(
+        {"name_lower": {"$regex": re.escape(q)}},
+        limit=limit * 5,
+    ).to_list(length=limit * 5)
 
     scored = []
     for row in docs:
         name = str(row.get("name", ""))
         lowered = name.lower()
         score = 0
-        if not q:
-            score = 1
-        elif lowered == q:
+        if lowered == q:
             score = 100
         elif lowered.startswith(q):
             score = 70
@@ -508,22 +508,22 @@ async def search_uploaded(query: str, limit: int = 15) -> List[UploadedSound]:
 
 async def search_videos(query: str, limit: int = 10) -> List[UploadedVideo]:
     q = clean_spaces(query).lower()
-    if q:
-        docs = await videos_collection.find(
-            {"name_lower": {"$regex": re.escape(q)}},
-            limit=limit * 3,
-        ).to_list(length=limit * 3)
-    else:
-        docs = await videos_collection.find({}).sort("created_at", -1).limit(limit).to_list(length=limit)
+    if not q:
+        pipeline = [{"$sample": {"size": limit}}]
+        docs = await videos_collection.aggregate(pipeline).to_list(length=limit)
+        return [UploadedVideo(**_filter_dataclass_fields(doc, UploadedVideo)) for doc in docs]
+
+    docs = await videos_collection.find(
+        {"name_lower": {"$regex": re.escape(q)}},
+        limit=limit * 3,
+    ).to_list(length=limit * 3)
 
     scored = []
     for row in docs:
         name = str(row.get("name", ""))
         lowered = name.lower()
         score = 0
-        if not q:
-            score = 1
-        elif lowered == q:
+        if lowered == q:
             score = 100
         elif lowered.startswith(q):
             score = 70
@@ -536,7 +536,7 @@ async def search_videos(query: str, limit: int = 10) -> List[UploadedVideo]:
     return [UploadedVideo(**_filter_dataclass_fields(item, UploadedVideo)) for _, item in scored[:limit]]
 
 # ============================================================
-# MYINSTANTS PARSING (same as before)
+# MYINSTANTS PARSING (unchanged)
 # ============================================================
 MYINSTANTS_BASE = "https://www.myinstants.com"
 MYINSTANTS_SEARCH = "https://www.myinstants.com/en/search/?name={query}"
@@ -796,7 +796,7 @@ async def cmd_upload(message: Message, state: FSMContext):
         return
     await state.set_state(UploadStates.waiting_media_batch)
     await message.answer(
-        "Send me audio files (voice, audio, document) – up to 20 at once.\n"
+        f"Send me audio files (voice, audio, document) – up to {BATCH_AUDIO_LIMIT} at once.\n"
         "For videos, send one at a time and I'll ask for a name.\n"
         f"Audio max {MAX_DURATION_SECONDS}s, {MAX_UPLOAD_SIZE_MB}MB.\n"
         f"Video max {VIDEO_MAX_DURATION_SEC}s, {VIDEO_MAX_SIZE_MB}MB."
@@ -813,13 +813,11 @@ async def batch_media_handler(message: Message, state: FSMContext):
     # Check if video sent separately
     media = extract_media(message)
     if media and media.kind in ("video", "video_document"):
-        # Single video -> ask for name
         can_up, reason = await can_upload(user_id, is_admin)
         if not can_up:
             await state.clear()
             await message.reply(f"❌ {reason}")
             return
-        # Size checks
         if media.file_size and media.file_size > VIDEO_MAX_SIZE_MB * 1024 * 1024:
             await state.clear()
             await message.reply(f"❌ Video exceeds {VIDEO_MAX_SIZE_MB}MB.")
@@ -828,7 +826,6 @@ async def batch_media_handler(message: Message, state: FSMContext):
             await state.clear()
             await message.reply(f"❌ Video duration exceeds {VIDEO_MAX_DURATION_SEC}s.")
             return
-        # Adult detection
         if not is_admin and await is_adult_content(b"", media.file_name or ""):
             warns = await add_warning(user_id, "Adult video detected")
             await state.clear()
@@ -841,12 +838,6 @@ async def batch_media_handler(message: Message, state: FSMContext):
 
     # Collect all media from the message (or media group)
     medias = []
-    if message.media_group_id:
-        # The current message is part of an album; we'll wait a short time to collect all
-        # For simplicity, we'll process only the current message; full album handling requires
-        # storing messages in a buffer. We'll assume user can send multiple messages.
-        pass
-    # Single message might contain one media
     if media:
         if media.kind not in ("voice", "audio", "document"):
             await message.reply("Only audio files are accepted in batch. Send videos separately.")
@@ -856,18 +847,19 @@ async def batch_media_handler(message: Message, state: FSMContext):
         await message.reply("No valid media found.")
         return
 
-    # Check limit
+    # Apply batch limit
+    medias = medias[:BATCH_AUDIO_LIMIT]
+
     can_up, reason = await can_upload(user_id, is_admin)
     if not can_up:
         await state.clear()
         await message.reply(f"❌ {reason}")
         return
 
-    # Process each audio
     status_msg = await message.answer("Processing...")
     success = 0
     failed = 0
-    for m in medias[:BATCH_UPLOAD_LIMIT]:
+    for m in medias:
         try:
             # Name generation
             if m.kind == "voice":
@@ -878,13 +870,11 @@ async def batch_media_handler(message: Message, state: FSMContext):
             if not name:
                 name = f"Sound_{uuid.uuid4().hex[:6]}"
 
-            # Adult check
             if not is_admin and await is_adult_content(b"", m.file_name or ""):
                 await add_warning(user_id, "Adult audio filename")
                 failed += 1
                 continue
 
-            # Size / duration checks
             if m.file_size and m.file_size > MAX_UPLOAD_SIZE_MB * 1024 * 1024:
                 failed += 1
                 continue
@@ -1000,7 +990,7 @@ async def show_admin_page(chat_id: int, coll: str, page: int, edit_msg_id: int =
     kb = InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text=f"🔊 Listen" if coll=="sounds" else "🎬 Watch",
                               callback_data=f"admin_view_{coll}_{items[0]['_id']}")],
-        [InlineKeyboardButton(text="🗑 Delete", callback_data=f"admin_delete_{coll}_{items[0]['_id']}")],
+        [InlineKeyboardButton(text="🗑 Delete", callback_data=f"admin_delete_{coll}_{items[0]['_id']}_{page}")],
         *admin_pagination_keyboard(coll, page, total_pages).inline_keyboard
     ])
     if edit_msg_id:
@@ -1036,25 +1026,24 @@ async def admin_callback_handler(callback: CallbackQuery):
         await callback.answer()
     elif action == "delete":
         item_id = data[3]
+        page = int(data[4])
         collection = sounds_collection if coll == "sounds" else videos_collection
         result = await collection.delete_one({"_id": item_id})
         if result.deleted_count:
             await callback.answer("Deleted", show_alert=True)
-            # Re-show page
-            page = int(data[4]) if len(data) > 4 else 0
             await show_admin_page(callback.message.chat.id, coll, page, edit_msg_id=callback.message.message_id)
         else:
             await callback.answer("Delete failed", show_alert=True)
 
 # ============================================================
-# INLINE MODE (with share count fix)
+# INLINE MODE (Random default + Smart search)
 # ============================================================
 @router.inline_query()
 async def inline_handler(inline_query: InlineQuery):
     query = clean_spaces(inline_query.query)
     results = []
 
-    sound_results = await search_uploaded(query, limit=15)
+    sound_results = await search_uploaded(query, limit=INLINE_RANDOM_LIMIT if not query else 15)
     for item in sound_results:
         if item.cached_voice_file_id:
             results.append(
@@ -1066,7 +1055,7 @@ async def inline_handler(inline_query: InlineQuery):
                 )
             )
 
-    video_results = await search_videos(query, limit=5)
+    video_results = await search_videos(query, limit=5 if not query else 5)
     for item in video_results:
         if item.cached_video_file_id:
             results.append(
@@ -1113,7 +1102,6 @@ async def inline_handler(inline_query: InlineQuery):
 @router.chosen_inline_result()
 async def chosen_result_handler(chosen: ChosenInlineResult):
     rid = chosen.result_id
-    # Format: "upload:Name:random"
     parts = rid.split(":")
     if len(parts) >= 2:
         prefix = parts[0]
@@ -1175,10 +1163,8 @@ async def cmd_update(message: Message):
             await msg.edit_text("✅ Already up-to-date.")
         else:
             await msg.edit_text(f"✅ Updated:\n<pre>{output[:300]}</pre>", parse_mode=ParseMode.HTML)
-            # Restart bot (requires process manager like systemd)
             await asyncio.sleep(1)
             await msg.edit_text("🔄 Restarting bot...")
-            # Send SIGTERM to ourselves; systemd should restart automatically
             os.kill(os.getpid(), 15)
     except Exception as e:
         await msg.edit_text(f"❌ Update failed: {e}")
