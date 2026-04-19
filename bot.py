@@ -49,7 +49,7 @@ STORAGE_CHAT_ID = int(os.getenv("STORAGE_CHAT_ID", "-1003897917299"))
 ADMIN_IDS = {int(x) for x in os.getenv("ADMIN_IDS", "7549407961").split(",") if x.strip().isdigit()}
 
 MONGODB_URI = os.getenv("MONGODB_URI", "mongodb+srv://SANKIXD:SANKIXD@cluster0.dgogcjs.mongodb.net/?retryWrites=true&w=majority&appName=Cluster0").strip()
-MONGODB_DB_NAME = os.getenv("MONGODB_DB_NAME", "tsinlinesbot").strip()
+MONGODB_DB_NAME = os.getenv("MONGODB_DB_NAME", "tssoundsbot").strip()
 
 SUPPORT_CHANNEL_URL = os.getenv("SUPPORT_CHANNEL_URL", "https://t.me/TEAMSANKI").strip()
 ADMIN_USERNAME = os.getenv("ADMIN_USERNAME", "ll_SANKI__II").strip().lstrip("@")
@@ -87,7 +87,7 @@ mongo_client = AsyncIOMotorClient(MONGODB_URI)
 db = mongo_client[MONGODB_DB_NAME]
 sounds_collection = db["sounds"]
 users_collection = db["users"]
-categories_collection = db["categories"]      # user categories
+categories_collection = db["categories"]
 
 # ============================================================
 # MODELS / STATES
@@ -352,6 +352,7 @@ async def add_badge(user_id: int, badge: str) -> None:
     if badge not in badges:
         badges.add(badge)
         await update_user(user_id, {"badges": list(badges)})
+        logger.info(f"Badge added to user {user_id}: {badge}")
 
 async def get_user_categories(user_id: int) -> List[str]:
     docs = await categories_collection.find({"user_id": user_id}).to_list(length=100)
@@ -427,11 +428,11 @@ async def save_uploaded_sound(
 async def search_uploaded(query: str, limit: int = 15) -> List[UploadedSound]:
     q = clean_spaces(query).lower()
     filter_dict = {}
-    # Check for category: prefix
+    # FIXED: Category search case‑insensitive exact match
     if q.startswith("category:"):
         cat = q[9:].strip()
         if cat:
-            filter_dict["category"] = cat
+            filter_dict["category"] = {"$regex": f"^{re.escape(cat)}$", "$options": "i"}
         q = ""
     if not q:
         pipeline = [{"$match": filter_dict}, {"$sample": {"size": limit}}]
@@ -461,7 +462,7 @@ async def search_uploaded(query: str, limit: int = 15) -> List[UploadedSound]:
     return [UploadedSound(**_filter_dataclass_fields(item, UploadedSound)) for _, item in scored[:limit]]
 
 # ============================================================
-# MYINSTANTS (unchanged, but kept)
+# MYINSTANTS (unchanged)
 # ============================================================
 MYINSTANTS_BASE = "https://www.myinstants.com"
 MYINSTANTS_SEARCH = "https://www.myinstants.com/en/search/?name={query}"
@@ -591,10 +592,8 @@ async def cmd_start(message: Message) -> None:
         f"👤 {user.full_name} (<code>{user.id}</code>)\n"
         f"💬 Chat: <code>{message.chat.id}</code>"
     )
-    # Update last_seen
     await update_user(user.id, {"last_seen": datetime.utcnow()})
 
-    # Build inline keyboard
     kb_rows = []
     kb_rows.append([
         InlineKeyboardButton(text="👤 PROFILE", callback_data="profile"),
@@ -647,15 +646,20 @@ async def profile_callback(callback: CallbackQuery):
         f"💎 Subscription: {sub_text}\n"
         f"🏅 Badges: {badges}"
     )
-    await callback.message.edit_caption(caption=text, parse_mode=ParseMode.HTML)
+    # FIXED: If message has no caption (text message), use edit_text
+    if callback.message.caption:
+        await callback.message.edit_caption(caption=text, parse_mode=ParseMode.HTML)
+    else:
+        await callback.message.edit_text(text, parse_mode=ParseMode.HTML)
     await callback.answer()
 
 @router.callback_query(F.data == "subscribe")
 async def subscribe_callback(callback: CallbackQuery):
-    await callback.message.edit_caption(
-        caption="💎 <b>Subscription</b>\n\n1 week unlimited uploads – ₹20\n\nUPI: yourupi@okhdfcbank\nAfter payment, contact admin.",
-        parse_mode=ParseMode.HTML
-    )
+    text = "💎 <b>Subscription</b>\n\n1 week unlimited uploads – ₹20\n\nUPI: yourupi@okhdfcbank\nAfter payment, contact admin."
+    if callback.message.caption:
+        await callback.message.edit_caption(caption=text, parse_mode=ParseMode.HTML)
+    else:
+        await callback.message.edit_text(text, parse_mode=ParseMode.HTML)
     await callback.answer()
 
 @router.callback_query(F.data == "top")
@@ -667,7 +671,10 @@ async def top_callback(callback: CallbackQuery):
             text += f"{i}. {s['name']} – {s['share_count']} shares\n"
     else:
         text += "No sounds yet.\n"
-    await callback.message.edit_caption(caption=text, parse_mode=ParseMode.HTML)
+    if callback.message.caption:
+        await callback.message.edit_caption(caption=text, parse_mode=ParseMode.HTML)
+    else:
+        await callback.message.edit_text(text, parse_mode=ParseMode.HTML)
     await callback.answer()
 
 @router.callback_query(F.data == "categories")
@@ -678,7 +685,10 @@ async def categories_callback(callback: CallbackQuery):
         text = "You have no categories. Upload a sound to create one."
     else:
         text = "📂 <b>Your Categories:</b>\n" + "\n".join(f"• {c}" for c in cats)
-    await callback.message.edit_caption(caption=text, parse_mode=ParseMode.HTML)
+    if callback.message.caption:
+        await callback.message.edit_caption(caption=text, parse_mode=ParseMode.HTML)
+    else:
+        await callback.message.edit_text(text, parse_mode=ParseMode.HTML)
     await callback.answer()
 
 @router.callback_query(F.data == "admin_panel")
@@ -691,7 +701,10 @@ async def admin_panel_callback(callback: CallbackQuery):
         [InlineKeyboardButton(text="👥 Users List", callback_data="admin_users")],
         [InlineKeyboardButton(text="⭐ Set Sound of Day", switch_inline_query_current_chat="feature:")],
     ])
-    await callback.message.edit_caption(caption="🛠️ Admin Panel", reply_markup=kb)
+    if callback.message.caption:
+        await callback.message.edit_caption(caption="🛠️ Admin Panel", reply_markup=kb)
+    else:
+        await callback.message.edit_text("🛠️ Admin Panel", reply_markup=kb)
     await callback.answer()
 
 @router.message(Command("profile"))
@@ -839,7 +852,6 @@ async def upload_receive_name(message: Message, state: FSMContext):
     cats = await get_user_categories(user_id)
 
     if cats:
-        # Show inline keyboard with existing categories + option to create new
         builder = InlineKeyboardMarkup(inline_keyboard=[])
         for cat in cats:
             builder.inline_keyboard.append([InlineKeyboardButton(text=cat, callback_data=f"cat_existing_{cat}")])
@@ -954,7 +966,7 @@ async def admin_users_callback(callback: CallbackQuery):
 
 async def show_admin_page(chat_id: int, coll: str, page: int, edit_msg_id: int = None):
     per_page = 5
-    collection = sounds_collection  # only sounds now
+    collection = sounds_collection
     total = await collection.count_documents({})
     total_pages = (total + per_page - 1) // per_page
     if total_pages == 0:
@@ -1041,7 +1053,6 @@ async def cmd_setfeatured(message: Message, command: CommandObject):
     if not name:
         await message.reply("Usage: /setfeatured <sound name>")
         return
-    # Clear previous featured
     await sounds_collection.update_many({"featured_until": {"$ne": None}}, {"$set": {"featured_until": None}})
     result = await sounds_collection.update_one(
         {"name": name},
@@ -1115,15 +1126,6 @@ async def inline_handler(inline_query: InlineQuery):
     query = clean_spaces(inline_query.query)
     results = []
 
-    # Check for featured setting via inline
-    if query.startswith("feature:"):
-        if inline_query.from_user.id not in ADMIN_IDS:
-            return
-        sound_name = query[8:].strip()
-        # Admin setting featured via inline query result selection
-        # We'll handle via chosen result
-        pass
-
     sound_results = await search_uploaded(query, limit=INLINE_RANDOM_LIMIT if not query else 15)
     for item in sound_results:
         if item.cached_voice_file_id:
@@ -1132,12 +1134,12 @@ async def inline_handler(inline_query: InlineQuery):
                     id=f"upload:{item.name}:{uuid.uuid4().hex[:8]}",
                     voice_file_id=item.cached_voice_file_id,
                     title=item.name,
-                    caption=f"{item.name}\n🔊 {item.category or 'Sound'}",
+                    caption=item.name,  # FIXED: sirf naam dikhao
                 )
             )
 
     remaining = max(0, 40 - len(results))
-    if remaining and query and MYINSTANTS_ENABLED:
+    if remaining and query and MYINSTANTS_ENABLED and not query.startswith("category:"):
         try:
             ext_results = await search_myinstants(query, limit=min(remaining, MAX_MYINSTANTS_RESULTS))
             for item in ext_results:
@@ -1146,7 +1148,7 @@ async def inline_handler(inline_query: InlineQuery):
                         id=f"mi:{item.name}:{uuid.uuid4().hex[:8]}",
                         audio_url=item.audio_url,
                         title=f"🔊 {item.name}",
-                        caption=f"{item.name}\nSource: Myinstants",
+                        caption=item.name,
                         performer="Myinstants",
                     )
                 )
