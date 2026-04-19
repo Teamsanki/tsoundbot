@@ -4,9 +4,9 @@ import logging
 import os
 import re
 import uuid
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from datetime import datetime, timedelta
-from typing import Any, Dict, List, Optional, Union
+from typing import Dict, List, Optional
 from urllib.parse import quote_plus, urljoin
 
 import aiohttp
@@ -25,6 +25,7 @@ from aiogram.types import (
     InlineKeyboardMarkup,
     InlineQuery,
     InlineQueryResultArticle,
+    InlineQueryResultAudio,
     InlineQueryResultCachedVideo,
     InlineQueryResultCachedVoice,
     InputTextMessageContent,
@@ -39,21 +40,20 @@ from motor.motor_asyncio import AsyncIOMotorClient
 load_dotenv()
 
 # ============================================================
-# CONFIG
+# CONFIG (Replace with your own values)
 # ============================================================
-
-BOT_TOKEN = os.getenv("BOT_TOKEN", "8697143769:AAHdC1mq-EP4lcPmoF4mMeEBykepTokObRE").strip()
-LOGGER_GROUP_ID = int(os.getenv("LOGGER_GROUP_ID", "-1003052988094"))
+BOT_TOKEN = os.getenv("BOT_TOKEN", "").strip()
+LOGGER_GROUP_ID = int(os.getenv("LOGGER_GROUP_ID", "0"))
 STORAGE_CHAT_ID = int(os.getenv("STORAGE_CHAT_ID", str(LOGGER_GROUP_ID)))
-ADMIN_IDS = {int(x) for x in os.getenv("ADMIN_IDS", "7549407961").split(",") if x.strip().isdigit()}
+ADMIN_IDS = {int(x) for x in os.getenv("ADMIN_IDS", "").split(",") if x.strip().isdigit()}
 
-MONGODB_URI = os.getenv("MONGODB_URI", "mongodb+srv://SANKIXD:SANKIXD@cluster0.dgogcjs.mongodb.net/?retryWrites=true&w=majority&appName=Cluster0").strip()
+MONGODB_URI = os.getenv("MONGODB_URI", "").strip()
 MONGODB_DB_NAME = os.getenv("MONGODB_DB_NAME", "tsoundbot").strip()
 
 SUPPORT_CHANNEL_URL = os.getenv("SUPPORT_CHANNEL_URL", "https://t.me/your_channel").strip()
-ADMIN_USERNAME = os.getenv("ADMIN_USERNAME", "ll_SANKI_II").strip().lstrip("@")
-WELCOME_IMAGE_URL = os.getenv("WELCOME_IMAGE_URL", "https://graph.org/file/533cd5ce5414981c731d5-3831c6c74a2525572c.jpg").strip()
-DEFAULT_THUMB_URL = os.getenv("DEFAULT_THUMB_URL", "https://graph.org/file/e8effa3891ad89ba1715f-f130b4cc47974de72a.jpg").strip()
+ADMIN_USERNAME = os.getenv("ADMIN_USERNAME", "admin").strip().lstrip("@")
+WELCOME_IMAGE_URL = os.getenv("WELCOME_IMAGE_URL", "").strip()
+DEFAULT_THUMB_URL = os.getenv("DEFAULT_THUMB_URL", "https://telegra.ph/file/xxx.png").strip()
 
 MAX_UPLOAD_SIZE_MB = float(os.getenv("MAX_UPLOAD_SIZE_MB", "10"))
 MAX_DURATION_SECONDS = int(os.getenv("MAX_DURATION_SECONDS", "60"))
@@ -130,7 +130,7 @@ class ExternalSound:
 
 @dataclass
 class MediaPayload:
-    kind: str  # voice / audio / document / video / video_document
+    kind: str
     file_id: str
     file_size: Optional[int]
     duration: Optional[int]
@@ -269,16 +269,8 @@ async def transcode_to_ogg_opus(input_bytes: bytes) -> bytes:
     return stdout
 
 async def is_adult_content(file_bytes: bytes, filename: str = "") -> bool:
-    """
-    Placeholder for adult content detection.
-    Replace with actual API call (e.g., Sightengine, Google Vision).
-    """
-    # For demonstration, we'll check filename for suspicious keywords.
     suspicious = ["porn", "xxx", "adult", "sex", "nude"]
-    lower_name = filename.lower()
-    if any(word in lower_name for word in suspicious):
-        return True
-    return False
+    return any(word in filename.lower() for word in suspicious)
 
 async def mirror_to_storage_voice(media: MediaPayload, title: str) -> str:
     title = clean_spaces(title)[:120]
@@ -311,7 +303,7 @@ async def mirror_to_storage_video(media: MediaPayload, title: str) -> str:
             caption=title,
             disable_notification=True,
         )
-    else:  # video_document
+    else:
         sent = await bot.send_video(
             chat_id=STORAGE_CHAT_ID,
             video=media.file_id,
@@ -334,14 +326,11 @@ async def ensure_indexes() -> None:
     await sounds_collection.create_index([("name_lower", 1)])
     await sounds_collection.create_index([("created_at", -1)])
     await sounds_collection.create_index([("uploader_id", 1)])
-    await sounds_collection.create_index([("cached_voice_file_id", 1)])
     await sounds_collection.create_index([("share_count", -1)])
-
     await videos_collection.create_index([("name_lower", 1)])
     await videos_collection.create_index([("created_at", -1)])
     await videos_collection.create_index([("uploader_id", 1)])
     await videos_collection.create_index([("share_count", -1)])
-
     await users_collection.create_index([("user_id", 1)], unique=True)
 
 # ============================================================
@@ -372,16 +361,13 @@ async def can_upload(user_id: int) -> tuple[bool, str]:
     if user.get("banned", False):
         return False, "You are banned from uploading."
     now = datetime.utcnow()
-    # Subscription check
     sub_exp = user.get("subscription_expiry")
     if sub_exp and sub_exp > now:
-        # Subscribed: check cooldown
         last_up = user.get("last_upload_time")
         if last_up and (now - last_up).total_seconds() < SUBSCRIPTION_COOLDOWN_SEC:
             return False, f"Cooldown: wait {SUBSCRIPTION_COOLDOWN_SEC - int((now - last_up).total_seconds())} seconds."
         return True, ""
     else:
-        # Free user: daily limit
         today = now.date().isoformat()
         daily = user.get("daily_uploads", {})
         count = daily.get(today, 0)
@@ -392,9 +378,7 @@ async def can_upload(user_id: int) -> tuple[bool, str]:
 async def record_upload(user_id: int, is_video: bool = False) -> None:
     user = await get_user(user_id)
     now = datetime.utcnow()
-    updates = {
-        "last_upload_time": now,
-    }
+    updates = {"last_upload_time": now}
     if is_video:
         updates["total_video_uploads"] = user.get("total_video_uploads", 0) + 1
     else:
@@ -420,8 +404,13 @@ async def add_warning(user_id: int, reason: str) -> int:
     return warnings
 
 # ============================================================
-# SAVE TO DB
+# SAVE TO DB (Fixed field filtering)
 # ============================================================
+
+def _filter_dataclass_fields(data: dict, cls):
+    """Keep only keys that are fields of the dataclass."""
+    allowed = {f.name for f in cls.__dataclass_fields__.values()}
+    return {k: v for k, v in data.items() if k in allowed}
 
 async def save_uploaded_sound(
     name: str,
@@ -453,7 +442,7 @@ async def save_uploaded_sound(
         {"$set": doc},
         upsert=True,
     )
-    return UploadedSound(**doc)
+    return UploadedSound(**_filter_dataclass_fields(doc, UploadedSound))
 
 async def save_uploaded_video(
     name: str,
@@ -484,7 +473,7 @@ async def save_uploaded_video(
         {"$set": doc},
         upsert=True,
     )
-    return UploadedVideo(**doc)
+    return UploadedVideo(**_filter_dataclass_fields(doc, UploadedVideo))
 
 # ============================================================
 # SEARCH
@@ -517,8 +506,7 @@ async def search_uploaded(query: str, limit: int = 15) -> List[UploadedSound]:
             scored.append((score, row))
 
     scored.sort(key=lambda x: (-x[0], x[1].get("name", "").lower()))
-    return [UploadedSound(**{k: v for k, v in item.items() if k in UploadedSound.__dataclass_fields__})
-            for _, item in scored[:limit]]
+    return [UploadedSound(**_filter_dataclass_fields(item, UploadedSound)) for _, item in scored[:limit]]
 
 async def search_videos(query: str, limit: int = 10) -> List[UploadedVideo]:
     q = clean_spaces(query).lower()
@@ -547,13 +535,138 @@ async def search_videos(query: str, limit: int = 10) -> List[UploadedVideo]:
             scored.append((score, row))
 
     scored.sort(key=lambda x: (-x[0], x[1].get("name", "").lower()))
-    return [UploadedVideo(**{k: v for k, v in item.items() if k in UploadedVideo.__dataclass_fields__})
-            for _, item in scored[:limit]]
+    return [UploadedVideo(**_filter_dataclass_fields(item, UploadedVideo)) for _, item in scored[:limit]]
 
 # ============================================================
-# MYINSTANTS (unchanged, but kept)
+# MYINSTANTS PARSING (FULLY IMPLEMENTED)
 # ============================================================
-# ... (same as original) ...
+
+MYINSTANTS_BASE = "https://www.myinstants.com"
+MYINSTANTS_SEARCH = "https://www.myinstants.com/en/search/?name={query}"
+HEADERS = {
+    "User-Agent": (
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+        "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Safari/537.36"
+    ),
+    "Accept-Language": "en-US,en;q=0.9",
+}
+
+def _title_from_anchor(a) -> str:
+    text = clean_spaces(a.get_text(" ", strip=True))
+    if text:
+        return text
+    for attr in ("title", "aria-label", "data-name", "data-title"):
+        val = clean_spaces(a.get(attr) or "")
+        if val:
+            return val
+    href = (a.get("href") or "").strip()
+    slug = href.rstrip("/").split("/")[-1]
+    slug = re.sub(r"-\d+$", "", slug)
+    slug = unquote(slug).replace("-", " ").replace("_", " ")
+    return clean_spaces(slug) or "Unknown sound"
+
+async def parse_myinstants_detail(session: aiohttp.ClientSession, page_url: str, fallback_title: str) -> Optional[ExternalSound]:
+    try:
+        async with session.get(page_url, timeout=aiohttp.ClientTimeout(total=20)) as resp:
+            if resp.status >= 400:
+                return None
+            html = await resp.text()
+    except Exception:
+        return None
+
+    soup = BeautifulSoup(html, "html.parser")
+    audio_url = None
+
+    # Find MP3 link
+    for a in soup.find_all("a", href=True):
+        href = a.get("href", "").strip()
+        if "/media/sounds/" in href and ".mp3" in href.lower():
+            audio_url = urljoin(MYINSTANTS_BASE, href)
+            break
+
+    if not audio_url:
+        for a in soup.find_all("a", href=True):
+            label = clean_spaces(a.get_text(" ", strip=True)).lower()
+            href = a.get("href", "").strip()
+            if "download mp3" in label and "/media/sounds/" in href and ".mp3" in href.lower():
+                audio_url = urljoin(MYINSTANTS_BASE, href)
+                break
+
+    if not audio_url:
+        m = re.search(r'(?:https?://[^"\']+)?(/media/sounds/[^"\']+\.mp3(?:\?[^"\']*)?)', html, re.I)
+        if m:
+            audio_url = urljoin(MYINSTANTS_BASE, m.group(1))
+
+    if not audio_url:
+        return None
+
+    title = clean_spaces(fallback_title)
+    h1 = soup.find("h1")
+    if h1:
+        h1_text = clean_spaces(h1.get_text(" ", strip=True))
+        if h1_text:
+            title = h1_text
+
+    return ExternalSound(name=title, page_url=page_url, audio_url=audio_url)
+
+async def search_myinstants(query: str, limit: int = 12) -> List[ExternalSound]:
+    if not MYINSTANTS_ENABLED or not query.strip():
+        return []
+
+    search_url = MYINSTANTS_SEARCH.format(query=quote_plus(query.strip()))
+    async with aiohttp.ClientSession(headers=HEADERS) as session:
+        try:
+            async with session.get(search_url, timeout=aiohttp.ClientTimeout(total=20)) as resp:
+                if resp.status >= 400:
+                    return []
+                html = await resp.text()
+        except Exception:
+            return []
+
+        soup = BeautifulSoup(html, "html.parser")
+        seen_urls = set()
+        candidates = []
+
+        for a in soup.find_all("a", href=True):
+            href = a.get("href", "").strip()
+            if "/instant/" not in href:
+                continue
+            page_url = urljoin(MYINSTANTS_BASE, href)
+            if page_url in seen_urls:
+                continue
+            title = _title_from_anchor(a)
+            if not title:
+                continue
+            seen_urls.add(page_url)
+            candidates.append((page_url, title))
+            if len(candidates) >= max(limit * 2, 20):
+                break
+
+        if not candidates:
+            return []
+
+        sem = asyncio.Semaphore(4)
+
+        async def worker(page_url: str, title: str) -> Optional[ExternalSound]:
+            async with sem:
+                return await parse_myinstants_detail(session, page_url, title)
+
+        tasks = [worker(url, title) for url, title in candidates]
+        resolved = await asyncio.gather(*tasks, return_exceptions=True)
+
+    results = []
+    used_urls = set()
+    for item in resolved:
+        if isinstance(item, Exception) or not item:
+            continue
+        if item.audio_url in used_urls:
+            continue
+        used_urls.add(item.audio_url)
+        results.append(item)
+        if len(results) >= limit:
+            break
+
+    return results
 
 # ============================================================
 # COMMANDS
@@ -614,19 +727,10 @@ async def cmd_profile(message: Message) -> None:
         f"💎 Subscription: {sub_text}\n"
     )
 
-    # Check if user has a sound in top 3
     top_sounds = await sounds_collection.find().sort("share_count", -1).limit(3).to_list(3)
     top_videos = await videos_collection.find().sort("share_count", -1).limit(3).to_list(3)
-    user_top_sound = None
-    for s in top_sounds:
-        if s.get("uploader_id") == user_id:
-            user_top_sound = s
-            break
-    user_top_video = None
-    for v in top_videos:
-        if v.get("uploader_id") == user_id:
-            user_top_video = v
-            break
+    user_top_sound = next((s for s in top_sounds if s.get("uploader_id") == user_id), None)
+    user_top_video = next((v for v in top_videos if v.get("uploader_id") == user_id), None)
 
     if user_top_sound:
         text += f"\n🏆 Your top sound: <b>{user_top_sound['name']}</b> (shared {user_top_sound['share_count']} times)"
@@ -722,7 +826,6 @@ async def upload_receive_media(message: Message, state: FSMContext) -> None:
         await message.reply(f"❌ {reason}")
         return
 
-    # Size checks
     is_video = media.kind in ("video", "video_document")
     max_size = VIDEO_MAX_SIZE_MB if is_video else MAX_UPLOAD_SIZE_MB
     max_dur = VIDEO_MAX_DURATION_SEC if is_video else MAX_DURATION_SECONDS
@@ -736,14 +839,8 @@ async def upload_receive_media(message: Message, state: FSMContext) -> None:
         await message.reply(f"❌ Duration exceeds {max_dur} seconds.")
         return
 
-    # Adult detection (download if needed)
-    file_bytes = None
-    if media.kind not in ("voice", "video"):  # for documents we need bytes
-        file_bytes = await fetch_telegram_file_bytes(media.file_id)
-    else:
-        # For voice/video we can just pass empty bytes; detection can be based on filename
-        file_bytes = b""
-    if await is_adult_content(file_bytes, media.file_name or ""):
+    # Adult detection (simple filename check)
+    if await is_adult_content(b"", media.file_name or ""):
         warns = await add_warning(user_id, f"Adult content detected in upload attempt")
         await state.clear()
         await message.reply(f"🔞 Adult content not allowed. Warning {warns}/5.")
@@ -868,7 +965,7 @@ async def inline_handler(inline_query: InlineQuery) -> None:
                 )
             )
 
-    # Myinstants (if enabled)
+    # Myinstants
     remaining = max(0, 40 - len(results))
     if remaining and query and MYINSTANTS_ENABLED:
         try:
@@ -902,14 +999,10 @@ async def inline_handler(inline_query: InlineQuery) -> None:
 
 @router.chosen_inline_result()
 async def chosen_result_handler(chosen: ChosenInlineResult) -> None:
-    # Increment share count
     rid = chosen.result_id
     if rid.startswith("upload:"):
-        # sound
         parts = rid.split(":")
         slug = parts[1] if len(parts) > 1 else ""
-        # Find by slug? Not perfect, but we can search by name.
-        # For simplicity, we'll update the first matching sound.
         await sounds_collection.update_one(
             {"name_lower": slug.replace("-", " ").lower()},
             {"$inc": {"share_count": 1}}
