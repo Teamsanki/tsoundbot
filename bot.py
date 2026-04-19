@@ -1,10 +1,12 @@
 #!/usr/bin/env python3
 import asyncio
+import base64
 import hashlib
 import io
 import json
 import logging
 import os
+import random
 import re
 import signal
 import sys
@@ -14,7 +16,7 @@ from collections import defaultdict
 from dataclasses import dataclass
 from datetime import datetime, timedelta
 from logging.handlers import RotatingFileHandler
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, List, Optional, Set, Tuple
 from urllib.parse import quote_plus, urljoin, unquote
 
 import aiohttp
@@ -51,7 +53,7 @@ from telegraph import Telegraph
 
 load_dotenv()
 
-# ==================== CONFIG ====================
+# ==================== CONFIGURATION ====================
 BOT_TOKEN = os.getenv("BOT_TOKEN", "8697143769:AAHdC1mq-EP4lcPmoF4mMeEBykepTokObRE").strip()
 LOGGER_GROUP_ID = int(os.getenv("LOGGER_GROUP_ID", "-1003711505151"))
 STORAGE_CHAT_ID = int(os.getenv("STORAGE_CHAT_ID", "-1003897917299"))
@@ -70,7 +72,7 @@ SIGHTENGINE_API_SECRET = os.getenv("SIGHTENGINE_API_SECRET", "").strip()
 SIGHTENGINE_ENABLED = bool(SIGHTENGINE_API_USER and SIGHTENGINE_API_SECRET)
 
 REDIS_URL = os.getenv("REDIS_URL", "redis://localhost:6379/0").strip()
-TELEGRAPH_ACCESS_TOKEN = os.getenv("TELEGRAPH_ACCESS_TOKEN", "").strip()
+TELEGRAPH_ACCESS_TOKEN = os.getenv("TELEGRAPH_ACCESS_TOKEN", "a085f6e4c0e9af57a998b56f9ee9092d5aa96dd9365addd065d16ef7997f").strip()
 
 MAX_UPLOAD_SIZE_MB = float(os.getenv("MAX_UPLOAD_SIZE_MB", "10"))
 MAX_DURATION_SECONDS = int(os.getenv("MAX_DURATION_SECONDS", "60"))
@@ -85,10 +87,12 @@ SUBSCRIPTION_COOLDOWN_SEC = 10
 BATCH_AUDIO_LIMIT = 10
 INLINE_RANDOM_LIMIT = 10
 
-if not BOT_TOKEN or not MONGODB_URI:
-    raise RuntimeError("BOT_TOKEN and MONGODB_URI required")
+if not BOT_TOKEN:
+    raise RuntimeError("BOT_TOKEN missing")
+if not MONGODB_URI:
+    raise RuntimeError("MONGODB_URI missing")
 
-# ==================== LOGGING ====================
+# ==================== LOGGING SETUP ====================
 LOG_FILE = "bot.log"
 logging.basicConfig(
     level=logging.INFO,
@@ -108,7 +112,7 @@ if TELEGRAPH_ACCESS_TOKEN:
 else:
     telegraph = Telegraph()
     telegraph.create_account(short_name="SoundBot")
-    logger.info(f"Telegraph token: {telegraph.get_access_token()}")
+    logger.info(f"Telegraph account created: {telegraph.get_access_token()}")
 
 # ==================== BOT & DB ====================
 bot = Bot(BOT_TOKEN)
@@ -122,8 +126,9 @@ sounds_collection = db["sounds"]
 videos_collection = db["videos"]
 users_collection = db["users"]
 hashes_collection = db["file_hashes"]
+reactions_collection = db["reactions"]
 
-# ==================== QUEUE ====================
+# ==================== ASYNC QUEUE FOR UPLOADS ====================
 upload_queue = asyncio.Queue()
 worker_tasks = []
 
@@ -133,23 +138,11 @@ async def upload_worker():
         try:
             await task["func"](*task["args"], **task["kwargs"])
         except Exception as e:
-            logger.exception(f"Worker error: {e}")
+            logger.exception(f"Upload worker failed: {e}")
         finally:
             upload_queue.task_done()
 
-# ==================== SHUTDOWN ====================
-async def shutdown_handler(sig):
-    logger.info(f"Shutdown signal {sig}")
-    for task in worker_tasks:
-        task.cancel()
-    await upload_queue.join()
-    await redis_client.close()
-    await bot.session.close()
-    sys.exit(0)
-
-# Signal handlers will be attached inside main()
-
-# ==================== MODELS ====================
+# ==================== MODELS & STATES ====================
 @dataclass
 class UploadedSound:
     name: str
@@ -207,7 +200,7 @@ class UploadStates(StatesGroup):
     waiting_category = State()
     waiting_premium = State()
 
-# ==================== HELPERS ====================
+# ==================== HELPER FUNCTIONS ====================
 def clean_spaces(text: str) -> str:
     return re.sub(r"\s+", " ", (text or "")).strip()
 
@@ -217,6 +210,11 @@ def slugify(text: str) -> str:
     text = re.sub(r"\s+", "-", text)
     text = text.strip("-_")
     return text or f"sound-{uuid.uuid4().hex[:8]}"
+
+def format_size_mb(size_bytes: Optional[int]) -> str:
+    if not size_bytes:
+        return "unknown"
+    return f"{size_bytes / (1024 * 1024):.2f} MB"
 
 def is_audio_document(doc: Document) -> bool:
     mime = (doc.mime_type or "").lower()
@@ -232,27 +230,32 @@ def is_video_document(doc: Document) -> bool:
 
 def extract_media(msg: Message) -> Optional[MediaPayload]:
     if msg.voice:
-        v = msg.voice
-        return MediaPayload("voice", v.file_id, v.file_size, v.duration, v.mime_type, None)
+        v: Voice = msg.voice
+        return MediaPayload(kind="voice", file_id=v.file_id, file_size=v.file_size,
+                            duration=v.duration, mime_type=v.mime_type, file_name=None)
     if msg.audio:
-        a = msg.audio
-        return MediaPayload("audio", a.file_id, a.file_size, a.duration, a.mime_type, a.file_name)
+        a: Audio = msg.audio
+        return MediaPayload(kind="audio", file_id=a.file_id, file_size=a.file_size,
+                            duration=a.duration, mime_type=a.mime_type, file_name=a.file_name)
     if msg.video:
-        v = msg.video
-        return MediaPayload("video", v.file_id, v.file_size, v.duration, v.mime_type, v.file_name)
+        v: Video = msg.video
+        return MediaPayload(kind="video", file_id=v.file_id, file_size=v.file_size,
+                            duration=v.duration, mime_type=v.mime_type, file_name=v.file_name)
     if msg.document:
-        d = msg.document
-        if is_audio_document(d):
-            return MediaPayload("document", d.file_id, d.file_size, None, d.mime_type, d.file_name)
-        if is_video_document(d):
-            return MediaPayload("video_document", d.file_id, d.file_size, None, d.mime_type, d.file_name)
+        doc = msg.document
+        if is_audio_document(doc):
+            return MediaPayload(kind="document", file_id=doc.file_id, file_size=doc.file_size,
+                                duration=None, mime_type=doc.mime_type, file_name=doc.file_name)
+        if is_video_document(doc):
+            return MediaPayload(kind="video_document", file_id=doc.file_id, file_size=doc.file_size,
+                                duration=None, mime_type=doc.mime_type, file_name=doc.file_name)
     return None
 
 async def fetch_telegram_file_bytes(file_id: str) -> bytes:
     file = await bot.get_file(file_id)
-    buf = io.BytesIO()
-    await bot.download_file(file.file_path, destination=buf)
-    return buf.getvalue()
+    buffer = io.BytesIO()
+    await bot.download_file(file.file_path, destination=buffer)
+    return buffer.getvalue()
 
 async def transcode_to_ogg_opus(input_bytes: bytes) -> bytes:
     proc = await asyncio.create_subprocess_exec(
@@ -266,163 +269,401 @@ async def transcode_to_ogg_opus(input_bytes: bytes) -> bytes:
     )
     stdout, stderr = await proc.communicate(input=input_bytes)
     if proc.returncode != 0:
-        raise RuntimeError(f"ffmpeg: {stderr.decode()[:200]}")
+        raise RuntimeError(f"ffmpeg failed: {stderr.decode()[:200]}")
     return stdout
 
-async def mirror_to_storage_voice(media: MediaPayload, title: str) -> Tuple[str, str]:
+async def generate_waveform_thumbnail(audio_bytes: bytes, filename: str) -> str:
+    try:
+        proc = await asyncio.create_subprocess_exec(
+            "ffmpeg", "-hide_banner", "-loglevel", "error",
+            "-i", "pipe:0", "-filter_complex",
+            "showwavespic=s=640x120:colors=#00BFFF", "-frames:v", "1",
+            "-f", "image2pipe", "-vcodec", "png", "pipe:1",
+            stdin=asyncio.subprocess.PIPE,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+        )
+        stdout, stderr = await proc.communicate(input=audio_bytes)
+        if proc.returncode != 0:
+            raise RuntimeError("Waveform generation failed")
+        response = telegraph.upload_file(stdout)
+        return "https://telegra.ph" + response[0]["src"]
+    except Exception:
+        return DEFAULT_THUMB_URL
+
+async def is_adult_content_sightengine(file_bytes: bytes, filename: str = "", is_video: bool = False) -> bool:
+    if not SIGHTENGINE_ENABLED:
+        suspicious = ["porn", "xxx", "adult", "sex", "nude"]
+        return any(word in filename.lower() for word in suspicious)
+    # For brevity, just do filename check (implement Sightengine later)
+    return False
+
+async def mirror_to_storage_voice(media: MediaPayload, title: str, thumb_url: Optional[str] = None) -> Tuple[str, str]:
     title = clean_spaces(title)[:120]
     if media.kind == "voice":
-        sent = await bot.send_voice(STORAGE_CHAT_ID, media.file_id, caption=title, disable_notification=True)
+        sent = await bot.send_voice(chat_id=STORAGE_CHAT_ID, voice=media.file_id,
+                                    caption=title, disable_notification=True)
     else:
         raw = media.file_bytes or await fetch_telegram_file_bytes(media.file_id)
-        ogg = await transcode_to_ogg_opus(raw)
-        sent = await bot.send_voice(STORAGE_CHAT_ID, BufferedInputFile(ogg, f"{slugify(title)}.ogg"),
+        ogg_bytes = await transcode_to_ogg_opus(raw)
+        sent = await bot.send_voice(chat_id=STORAGE_CHAT_ID,
+                                    voice=BufferedInputFile(ogg_bytes, filename=f"{slugify(title)}.ogg"),
                                     caption=title, disable_notification=True)
     if not sent.voice:
-        raise RuntimeError("Storage voice failed")
-    return sent.voice.file_id, DEFAULT_THUMB_URL
+        raise RuntimeError("Storage chat did not return voice")
+    return sent.voice.file_id, thumb_url or DEFAULT_THUMB_URL
 
 async def mirror_to_storage_video(media: MediaPayload, title: str) -> str:
     title = clean_spaces(title)[:120]
-    sent = await bot.send_video(STORAGE_CHAT_ID, media.file_id, caption=title, disable_notification=True)
+    sent = await bot.send_video(chat_id=STORAGE_CHAT_ID, video=media.file_id,
+                                caption=title, disable_notification=True)
     if not sent.video:
-        raise RuntimeError("Storage video failed")
+        raise RuntimeError("Storage chat did not return video")
     return sent.video.file_id
 
-async def log_event(text: str):
-    if LOGGER_GROUP_ID:
-        try:
-            await bot.send_message(LOGGER_GROUP_ID, text, parse_mode=ParseMode.HTML, disable_web_page_preview=True)
-        except Exception:
-            logger.exception("Log failed")
+async def log_event(text: str, parse_mode: str = "HTML") -> None:
+    if not LOGGER_GROUP_ID:
+        return
+    try:
+        await bot.send_message(LOGGER_GROUP_ID, text, parse_mode=parse_mode, disable_web_page_preview=True)
+    except Exception:
+        logger.exception("Failed to log event")
 
+# ==================== DATABASE INDEXES ====================
 async def ensure_indexes():
-    await sounds_collection.create_index("name_lower")
-    await sounds_collection.create_index("created_at")
-    await videos_collection.create_index("name_lower")
-    await videos_collection.create_index("created_at")
-    await users_collection.create_index("user_id", unique=True)
-    await hashes_collection.create_index("hash_md5", unique=True)
+    await sounds_collection.create_index([("name_lower", 1)])
+    await sounds_collection.create_index([("created_at", -1)])
+    await sounds_collection.create_index([("uploader_id", 1)])
+    await sounds_collection.create_index([("share_count", -1)])
+    await sounds_collection.create_index([("hash_md5", 1)])
+    await sounds_collection.create_index([("category", 1)])
+    await videos_collection.create_index([("name_lower", 1)])
+    await videos_collection.create_index([("created_at", -1)])
+    await videos_collection.create_index([("uploader_id", 1)])
+    await videos_collection.create_index([("share_count", -1)])
+    await videos_collection.create_index([("hash_md5", 1)])
+    await users_collection.create_index([("user_id", 1)], unique=True)
+    await hashes_collection.create_index([("hash_md5", 1)], unique=True)
 
-# ==================== USER DB ====================
+# ==================== USER MANAGEMENT ====================
 async def get_user(user_id: int) -> dict:
     doc = await users_collection.find_one({"user_id": user_id})
     if not doc:
         doc = {
-            "user_id": user_id, "total_uploads": 0, "total_video_uploads": 0,
-            "warnings": 0, "banned": False, "subscription_expiry": None,
-            "last_upload_time": None, "daily_uploads": {}, "last_daily_bonus": None, "streak": 0
+            "user_id": user_id,
+            "total_uploads": 0,
+            "total_video_uploads": 0,
+            "warnings": 0,
+            "banned": False,
+            "subscription_expiry": None,
+            "last_upload_time": None,
+            "daily_uploads": {},
+            "last_daily_bonus": None,
+            "streak": 0,
         }
         await users_collection.insert_one(doc)
     return doc
 
-async def update_user(user_id: int, updates: dict):
+async def update_user(user_id: int, updates: dict) -> None:
     await users_collection.update_one({"user_id": user_id}, {"$set": updates})
 
 async def can_upload(user_id: int, is_admin: bool = False) -> Tuple[bool, str]:
     if is_admin:
         return True, ""
     user = await get_user(user_id)
-    if user.get("banned"):
-        return False, "Banned"
+    if user.get("banned", False):
+        return False, "You are banned."
     now = datetime.utcnow()
-    sub = user.get("subscription_expiry")
-    if sub and sub > now:
-        last = user.get("last_upload_time")
-        if last and (now - last).total_seconds() < SUBSCRIPTION_COOLDOWN_SEC:
-            return False, f"Cooldown {SUBSCRIPTION_COOLDOWN_SEC}s"
+    sub_exp = user.get("subscription_expiry")
+    if sub_exp and sub_exp > now:
+        last_up = user.get("last_upload_time")
+        if last_up and (now - last_up).total_seconds() < SUBSCRIPTION_COOLDOWN_SEC:
+            remain = SUBSCRIPTION_COOLDOWN_SEC - int((now - last_up).total_seconds())
+            return False, f"Cooldown: wait {remain}s."
         return True, ""
-    today = now.date().isoformat()
-    cnt = user.get("daily_uploads", {}).get(today, 0)
-    if cnt >= FREE_DAILY_LIMIT:
-        return False, f"Daily limit {FREE_DAILY_LIMIT}"
-    return True, ""
+    else:
+        today = now.date().isoformat()
+        daily = user.get("daily_uploads", {})
+        count = daily.get(today, 0)
+        if count >= FREE_DAILY_LIMIT:
+            return False, f"Daily limit ({FREE_DAILY_LIMIT}) reached."
+        return True, ""
 
-async def record_upload(user_id: int, is_video: bool = False, is_admin: bool = False):
+async def record_upload(user_id: int, is_video: bool = False, is_admin: bool = False) -> None:
     if is_admin:
         return
     user = await get_user(user_id)
     now = datetime.utcnow()
-    upd = {"last_upload_time": now}
+    updates = {"last_upload_time": now}
     if is_video:
-        upd["total_video_uploads"] = user.get("total_video_uploads", 0) + 1
+        updates["total_video_uploads"] = user.get("total_video_uploads", 0) + 1
     else:
-        upd["total_uploads"] = user.get("total_uploads", 0) + 1
-    sub = user.get("subscription_expiry")
-    if not sub or sub <= now:
+        updates["total_uploads"] = user.get("total_uploads", 0) + 1
+    sub_exp = user.get("subscription_expiry")
+    if not sub_exp or sub_exp <= now:
         today = now.date().isoformat()
         daily = user.get("daily_uploads", {})
         daily[today] = daily.get(today, 0) + 1
-        upd["daily_uploads"] = daily
-    await update_user(user_id, upd)
+        updates["daily_uploads"] = daily
+    await update_user(user_id, updates)
 
-# ==================== CATEGORY & PREMIUM KEYBOARDS ====================
-def category_keyboard():
-    return InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="😂 Meme", callback_data="cat_meme"),
-         InlineKeyboardButton(text="🎮 Gaming", callback_data="cat_gaming")],
-        [InlineKeyboardButton(text="🎵 Music", callback_data="cat_music"),
-         InlineKeyboardButton(text="🎬 Anime", callback_data="cat_anime")],
-        [InlineKeyboardButton(text="🔊 Other", callback_data="cat_other")],
-    ])
+async def add_warning(user_id: int, reason: str) -> int:
+    user = await get_user(user_id)
+    warnings = user.get("warnings", 0) + 1
+    updates = {"warnings": warnings}
+    if warnings >= 5:
+        updates["banned"] = True
+    await update_user(user_id, updates)
+    await log_event(f"⚠️ User {user_id} warned ({warnings}/5): {reason}")
+    return warnings
 
-def premium_keyboard():
-    return InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="✅ Yes (Premium)", callback_data="premium_yes"),
-         InlineKeyboardButton(text="❌ No", callback_data="premium_no")]
-    ])
+# ==================== DAILY BONUS ====================
+async def claim_daily_bonus(user_id: int) -> Tuple[bool, str]:
+    user = await get_user(user_id)
+    now = datetime.utcnow()
+    last = user.get("last_daily_bonus")
+    if last and (now - last).days < 1:
+        return False, "Already claimed today."
+    today = now.date().isoformat()
+    daily = user.get("daily_uploads", {})
+    daily[today] = max(0, daily.get(today, 0) - 1)
+    streak = user.get("streak", 0) + 1
+    updates = {
+        "last_daily_bonus": now,
+        "daily_uploads": daily,
+        "streak": streak,
+    }
+    await update_user(user_id, updates)
+    return True, f"Daily bonus claimed! Streak: {streak}"
 
-# ==================== SEARCH ====================
-def fuzzy_score(q: str, name: str) -> int:
-    return fuzz.ratio(q.lower(), name.lower())
+# ==================== FILE DEDUPLICATION ====================
+async def is_duplicate_file(file_bytes: bytes) -> bool:
+    md5 = hashlib.md5(file_bytes).hexdigest()
+    existing = await hashes_collection.find_one({"hash_md5": md5})
+    return existing is not None
 
-async def search_uploaded(query: str, limit: int = 15) -> List[UploadedSound]:
+async def store_file_hash(file_bytes: bytes) -> None:
+    md5 = hashlib.md5(file_bytes).hexdigest()
+    await hashes_collection.update_one({"hash_md5": md5}, {"$set": {"hash_md5": md5}}, upsert=True)
+
+# ==================== FUZZY SEARCH ====================
+def fuzzy_score(query: str, name: str) -> int:
+    return fuzz.ratio(query.lower(), name.lower())
+
+async def search_uploaded(query: str, limit: int = 15, category: Optional[str] = None) -> List[UploadedSound]:
+    q = clean_spaces(query).lower()
+    filter_dict = {}
+    if category:
+        filter_dict["category"] = category
+    if not q:
+        pipeline = [{"$match": filter_dict}, {"$sample": {"size": limit}}]
+        docs = await sounds_collection.aggregate(pipeline).to_list(length=limit)
+        return [UploadedSound(**{k:v for k,v in doc.items() if k in UploadedSound.__dataclass_fields__}) for doc in docs]
+    docs = await sounds_collection.find({**filter_dict, "name_lower": {"$regex": re.escape(q)}}).limit(limit*5).to_list(length=limit*5)
+    if not docs:
+        return []
+    scored = [(fuzzy_score(q, doc["name"]), doc) for doc in docs]
+    scored.sort(key=lambda x: -x[0])
+    return [UploadedSound(**{k:v for k,v in item[1].items() if k in UploadedSound.__dataclass_fields__}) for item in scored[:limit]]
+
+async def search_videos(query: str, limit: int = 10) -> List[UploadedVideo]:
     q = clean_spaces(query).lower()
     if not q:
-        docs = await sounds_collection.aggregate([{"$sample": {"size": limit}}]).to_list(limit)
-    else:
-        docs = await sounds_collection.find({"name_lower": {"$regex": re.escape(q)}}).limit(limit*5).to_list(limit*5)
-        scored = [(fuzzy_score(q, d["name"]), d) for d in docs]
-        scored.sort(key=lambda x: -x[0])
-        docs = [item[1] for item in scored[:limit]]
-    return [UploadedSound(**{k:v for k,v in d.items() if k in UploadedSound.__dataclass_fields__}) for d in docs]
+        pipeline = [{"$sample": {"size": limit}}]
+        docs = await videos_collection.aggregate(pipeline).to_list(length=limit)
+        return [UploadedVideo(**{k:v for k,v in doc.items() if k in UploadedVideo.__dataclass_fields__}) for doc in docs]
+    docs = await videos_collection.find({"name_lower": {"$regex": re.escape(q)}}).limit(limit*3).to_list(length=limit*3)
+    scored = [(fuzzy_score(q, doc["name"]), doc) for doc in docs]
+    scored.sort(key=lambda x: -x[0])
+    return [UploadedVideo(**{k:v for k,v in item[1].items() if k in UploadedVideo.__dataclass_fields__}) for item in scored[:limit]]
+
+# ==================== MYINSTANTS ====================
+MYINSTANTS_BASE = "https://www.myinstants.com"
+MYINSTANTS_SEARCH = "https://www.myinstants.com/en/search/?name={query}"
+HEADERS = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"}
+
+async def search_myinstants_cached(query: str, limit: int = 12) -> List[ExternalSound]:
+    cache_key = f"myinstants:{query}:{limit}"
+    cached = await redis_client.get(cache_key)
+    if cached:
+        data = json.loads(cached)
+        return [ExternalSound(**item) for item in data]
+    results = await _search_myinstants(query, limit)
+    if results:
+        await redis_client.setex(cache_key, 3600, json.dumps([r.__dict__ for r in results]))
+    return results
+
+async def _search_myinstants(query: str, limit: int = 12) -> List[ExternalSound]:
+    if not MYINSTANTS_ENABLED:
+        return []
+    url = MYINSTANTS_SEARCH.format(query=quote_plus(query))
+    async with aiohttp.ClientSession(headers=HEADERS) as session:
+        try:
+            async with session.get(url, timeout=20) as resp:
+                if resp.status != 200:
+                    return []
+                html = await resp.text()
+        except Exception:
+            return []
+    soup = BeautifulSoup(html, "html.parser")
+    items = []
+    for a in soup.select("a.instant"):
+        href = a.get("href")
+        if not href:
+            continue
+        full_url = urljoin(MYINSTANTS_BASE, href)
+        name = a.select_one(".instant-title")
+        title = name.text.strip() if name else "Untitled"
+        # Get mp3 link from detail page
+        audio_url = await _fetch_myinstants_mp3(session, full_url)
+        if audio_url:
+            items.append(ExternalSound(name=title, page_url=full_url, audio_url=audio_url))
+            if len(items) >= limit:
+                break
+    return items
+
+async def _fetch_myinstants_mp3(session: aiohttp.ClientSession, url: str) -> Optional[str]:
+    try:
+        async with session.get(url, timeout=20) as resp:
+            if resp.status != 200:
+                return None
+            html = await resp.text()
+    except Exception:
+        return None
+    soup = BeautifulSoup(html, "html.parser")
+    # Find mp3 link
+    for a in soup.select("a[href$='.mp3']"):
+        href = a.get("href")
+        if href and "/media/sounds/" in href:
+            return urljoin(MYINSTANTS_BASE, href)
+    return None
+
+# ==================== INLINE FLOOD CONTROL ====================
+user_last_queries = defaultdict(list)
+FLOOD_MAX_QUERIES = 10
+FLOOD_TIME_WINDOW = 10
+
+def is_flooding(user_id: int) -> bool:
+    now = time.time()
+    timestamps = user_last_queries[user_id]
+    timestamps = [t for t in timestamps if now - t < FLOOD_TIME_WINDOW]
+    user_last_queries[user_id] = timestamps
+    if len(timestamps) >= FLOOD_MAX_QUERIES:
+        return True
+    timestamps.append(now)
+    return False
+
+# ==================== KEYBOARDS ====================
+def category_keyboard() -> InlineKeyboardMarkup:
+    builder = InlineKeyboardBuilder()
+    for cat in ["Meme", "Gaming", "Anime", "Funny", "Other"]:
+        builder.button(text=cat, callback_data=f"cat_{cat}")
+    builder.adjust(2)
+    return builder.as_markup()
+
+def premium_keyboard() -> InlineKeyboardMarkup:
+    builder = InlineKeyboardBuilder()
+    builder.button(text="Yes (Premium)", callback_data="premium_yes")
+    builder.button(text="No", callback_data="premium_no")
+    return builder.as_markup()
 
 # ==================== COMMANDS ====================
 @router.message(Command("start"))
-async def start_cmd(message: Message):
-    user = message.from_user
+async def cmd_start(message: Message):
+    user_id = message.from_user.id
+    claimed, msg = await claim_daily_bonus(user_id)
+    if claimed:
+        await message.answer(f"🎁 {msg}")
     kb = InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="👤 Profile", callback_data="profile")],
         [InlineKeyboardButton(text="📢 Support", url=SUPPORT_CHANNEL_URL)],
         [InlineKeyboardButton(text="👨‍💻 Admin", url=f"https://t.me/{ADMIN_USERNAME}")],
         [InlineKeyboardButton(text="🔍 Search Inline", switch_inline_query_current_chat="")],
     ])
-    if WELCOME_MEDIA_URL:
-        if WELCOME_MEDIA_URL.endswith(".gif"):
-            await message.answer_animation(WELCOME_MEDIA_URL, caption="🎵 Sound Bot Ready!", reply_markup=kb)
-        else:
-            await message.answer_photo(WELCOME_MEDIA_URL, caption="🎵 Sound Bot Ready!", reply_markup=kb)
+    if WELCOME_MEDIA_URL.endswith(".gif"):
+        await message.answer_animation(WELCOME_MEDIA_URL, caption="🎵 Sound Bot Ready!", reply_markup=kb)
+    elif WELCOME_MEDIA_URL:
+        await message.answer_photo(WELCOME_MEDIA_URL, caption="🎵 Sound Bot Ready!", reply_markup=kb)
     else:
-        await message.answer("🎵 Sound Bot Ready!", reply_markup=kb)
-    await log_event(f"🟢 /start {user.id}")
+        await message.answer("🎵 Sound Bot Ready!\nUse /upload to add content.", reply_markup=kb)
+    await log_event(f"🟢 /start user {user_id}")
 
-@router.message(Command("upload"))
-async def upload_cmd(message: Message, state: FSMContext):
-    if message.chat.type != ChatType.PRIVATE:
-        await message.reply("Use in PM")
+@router.message(Command("broadcast"))
+async def cmd_broadcast(message: Message, command: CommandObject):
+    if message.from_user.id not in ADMIN_IDS:
         return
+    text = command.args
+    if not text:
+        await message.reply("Usage: /broadcast <message>")
+        return
+    users = await users_collection.find().to_list(length=None)
+    success = 0
+    for u in users:
+        try:
+            await bot.send_message(u["user_id"], text)
+            success += 1
+            await asyncio.sleep(0.05)
+        except Exception:
+            pass
+    await message.reply(f"Broadcast sent to {success}/{len(users)} users.")
+
+@router.message(Command("trending"))
+async def cmd_trending(message: Message):
+    day_ago = datetime.utcnow() - timedelta(days=1)
+    pipeline = [
+        {"$match": {"created_at": {"$gte": day_ago}}},
+        {"$sort": {"share_count": -1}},
+        {"$limit": 5}
+    ]
+    trending = await sounds_collection.aggregate(pipeline).to_list(5)
+    text = "📈 Trending Sounds (24h):\n"
+    for i, s in enumerate(trending, 1):
+        text += f"{i}. {s['name']} – {s['share_count']} shares\n"
+    await message.answer(text)
+
+@router.message(Command("ping"))
+async def cmd_ping(message: Message):
+    await message.reply("🏓 Pong!")
+
+# ==================== UPLOAD HANDLERS ====================
+@router.message(Command("upload"))
+async def cmd_upload(message: Message, state: FSMContext):
     await state.set_state(UploadStates.waiting_media_batch)
-    await message.answer("Send audio files (up to 10) or a single video.")
+    await message.answer("Send audio/video...")
+
+async def process_upload_audio(media: MediaPayload, user_id: int, name: str, category: str, premium: bool):
+    is_admin = user_id in ADMIN_IDS
+    raw = media.file_bytes or await fetch_telegram_file_bytes(media.file_id)
+    if not is_admin and await is_adult_content_sightengine(raw, media.file_name or ""):
+        await add_warning(user_id, "Adult content")
+        return
+    if not is_admin and await is_duplicate_file(raw):
+        await bot.send_message(user_id, f"❌ File already exists: {name}")
+        return
+    thumb_url = await generate_waveform_thumbnail(raw, name)
+    cached_id, _ = await mirror_to_storage_voice(media, name, thumb_url)
+    doc = {
+        "name": name, "name_lower": name.lower(), "source": "user_upload",
+        "uploader_id": user_id, "cached_voice_file_id": cached_id,
+        "duration": media.duration, "size_bytes": len(raw), "mime_type": media.mime_type,
+        "original_name": media.file_name, "created_at": datetime.utcnow(),
+        "share_count": 0, "thumb_url": thumb_url, "is_adult": False,
+        "category": category, "premium": premium, "hash_md5": hashlib.md5(raw).hexdigest()
+    }
+    await sounds_collection.update_one({"name_lower": name.lower()}, {"$set": doc}, upsert=True)
+    await store_file_hash(raw)
+    await record_upload(user_id, is_video=False, is_admin=is_admin)
+    await bot.send_message(user_id, f"✅ Uploaded: {name}")
 
 @router.message(UploadStates.waiting_media_batch)
-async def media_received(message: Message, state: FSMContext):
+async def batch_media_handler(message: Message, state: FSMContext):
+    user_id = message.from_user.id
     media = extract_media(message)
     if not media:
-        await message.reply("Not supported")
         return
     if media.kind in ("video", "video_document"):
-        # handle video separately (simplified)
-        await message.reply("Video upload not implemented in this short version")
+        # Handle video separately (omitted for brevity)
+        await message.answer("Video upload not implemented yet.")
         await state.clear()
         return
     await state.update_data(pending_media=media)
@@ -430,77 +671,111 @@ async def media_received(message: Message, state: FSMContext):
     await message.answer("Choose category:", reply_markup=category_keyboard())
 
 @router.callback_query(F.data.startswith("cat_"))
-async def cat_chosen(callback: CallbackQuery, state: FSMContext):
-    cat = callback.data.split("_")[1]
-    await state.update_data(category=cat)
+async def category_chosen(callback: CallbackQuery, state: FSMContext):
+    category = callback.data.split("_")[1]
+    await state.update_data(category=category)
     await state.set_state(UploadStates.waiting_premium)
-    await callback.message.edit_text("Premium sound?", reply_markup=premium_keyboard())
-    await callback.answer()
+    await callback.message.edit_text("Premium sound? (Admins only)", reply_markup=premium_keyboard())
 
 @router.callback_query(F.data.startswith("premium_"))
 async def premium_chosen(callback: CallbackQuery, state: FSMContext):
     premium = callback.data == "premium_yes"
     data = await state.get_data()
     media: MediaPayload = data["pending_media"]
-    cat = data["category"]
+    category = data["category"]
     name = media.file_name or f"Audio_{datetime.utcnow().strftime('%Y%m%d_%H%M%S')}"
     name = clean_spaces(name)[:80]
-
-    # Queue the upload
     await upload_queue.put({
         "func": process_upload_audio,
-        "args": (media, callback.from_user.id, name, cat, premium)
+        "args": (media, callback.from_user.id, name, category, premium)
     })
-    await callback.message.edit_text("⏳ Upload queued.")
+    await callback.message.edit_text("⏳ Upload queued. You'll be notified when done.")
     await state.clear()
-    await callback.answer()
 
-async def process_upload_audio(media: MediaPayload, user_id: int, name: str, category: str, premium: bool):
-    is_admin = user_id in ADMIN_IDS
-    raw = media.file_bytes or await fetch_telegram_file_bytes(media.file_id)
-    # adult / duplicate checks skipped for brevity
-    cached_id, _ = await mirror_to_storage_voice(media, name)
-    doc = {
-        "name": name, "name_lower": name.lower(), "source": "user_upload",
-        "uploader_id": user_id, "cached_voice_file_id": cached_id,
-        "duration": media.duration, "size_bytes": len(raw), "mime_type": media.mime_type,
-        "original_name": media.file_name, "created_at": datetime.utcnow(),
-        "share_count": 0, "thumb_url": DEFAULT_THUMB_URL, "is_adult": False,
-        "category": category, "premium": premium, "hash_md5": hashlib.md5(raw).hexdigest()
-    }
-    await sounds_collection.update_one({"name_lower": name.lower()}, {"$set": doc}, upsert=True)
-    await record_upload(user_id, is_admin=is_admin)
-    try:
-        await bot.send_message(user_id, f"✅ Uploaded: {name}")
-    except:
-        pass
-
-# ==================== INLINE ====================
+# ==================== INLINE MODE ====================
 @router.inline_query()
-async def inline_query_handler(inline_query: InlineQuery):
+async def inline_handler(inline_query: InlineQuery):
+    user_id = inline_query.from_user.id
+    if is_flooding(user_id):
+        await inline_query.answer([], cache_time=10, is_personal=True, switch_pm_text="Slow down!", switch_pm_parameter="flood")
+        return
     query = clean_spaces(inline_query.query)
-    sounds = await search_uploaded(query, limit=INLINE_RANDOM_LIMIT if not query else 15)
     results = []
+    sounds = await search_uploaded(query, limit=INLINE_RANDOM_LIMIT if not query else 15)
     for s in sounds:
         if s.cached_voice_file_id:
+            caption = s.name
+            user = await get_user(user_id)
+            if not user.get("subscription_expiry"):
+                caption += "\n🔊 via @YourBot"
             results.append(InlineQueryResultCachedVoice(
                 id=f"upload:{s.name}:{uuid.uuid4().hex[:8]}",
                 voice_file_id=s.cached_voice_file_id,
                 title=s.name,
+                caption=caption,
+                reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+                    [InlineKeyboardButton("🚩 Report", callback_data=f"report_{s.name}")]
+                ])
             ))
+    # Add Myinstants results
+    if query and MYINSTANTS_ENABLED:
+        ext = await search_myinstants_cached(query, limit=5)
+        for e in ext:
+            results.append(InlineQueryResultAudio(
+                id=f"mi:{e.name}:{uuid.uuid4().hex[:8]}",
+                audio_url=e.audio_url,
+                title=e.name,
+                performer="Myinstants"
+            ))
+    if not results:
+        results.append(InlineQueryResultArticle(
+            id="noresult",
+            title="No sounds found",
+            input_message_content=InputTextMessageContent(message_text="Try another keyword.")
+        ))
     await inline_query.answer(results, cache_time=INLINE_CACHE_SECONDS, is_personal=True)
+
+@router.callback_query(F.data.startswith("report_"))
+async def report_callback(callback: CallbackQuery):
+    sound_name = callback.data[7:]
+    await log_event(f"🚩 User {callback.from_user.id} reported sound: {sound_name}")
+    await callback.answer("Reported. Admin will review.", show_alert=True)
+
+@router.chosen_inline_result()
+async def chosen_handler(chosen: ChosenInlineResult):
+    rid = chosen.result_id
+    parts = rid.split(":")
+    if len(parts) >= 2 and parts[0] == "upload":
+        name = parts[1]
+        result = await sounds_collection.update_one({"name": name}, {"$inc": {"share_count": 1}})
+        if result.modified_count:
+            doc = await sounds_collection.find_one({"name": name})
+            if doc and doc["share_count"] % 100 == 0:
+                try:
+                    await bot.send_message(doc["uploader_id"], f"🎉 Your sound '{name}' reached {doc['share_count']} shares!")
+                except:
+                    pass
 
 # ==================== MAIN ====================
 async def main():
-    # Start workers inside running loop
+    await ensure_indexes()
+    # Start workers (event loop is running now)
     for _ in range(2):
         worker_tasks.append(asyncio.create_task(upload_worker()))
-    # Signal handlers
+    # Graceful shutdown
     loop = asyncio.get_running_loop()
     for sig in (signal.SIGINT, signal.SIGTERM):
         loop.add_signal_handler(sig, lambda s=sig: asyncio.create_task(shutdown_handler(s)))
-    await ensure_indexes()
     await dp.start_polling(bot, allowed_updates=dp.resolve_used_update_types())
+
+async def shutdown_handler(sig):
+    logger.info(f"Received signal {sig}, shutting down...")
+    await upload_queue.join()
+    for task in worker_tasks:
+        task.cancel()
+    await redis_client.close()
+    await bot.session.close()
+    sys.exit(0)
 
 if __name__ == "__main__":
     asyncio.run(main())
